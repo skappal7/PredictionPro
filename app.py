@@ -835,7 +835,7 @@ with tab4:
                                 st.dataframe(results, use_container_width=True)
                                 csv_buf = io.StringIO()
                                 results.to_csv(csv_buf, index=False)
-                                st.download_button('📥 Download Predictions CSV', data=csv_buf.getvalue(), file_name=f'predictions_{new_file.name.split('.')[0]}.csv')
+                                st.download_button('📥 Download Predictions CSV', data=csv_buf.getvalue(), file_name=f"predictions_{new_file.name.split('.')[0]}.csv")
                             except Exception as e:
                                 st.error(f'Prediction failed: {e}')
                                 st.text(traceback.format_exc())
