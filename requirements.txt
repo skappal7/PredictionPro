@@ -5,6 +5,7 @@ scikit-learn
 imbalanced-learn
 ydata-profiling
 explainerdashboard
+plotly
 shap
 matplotlib
 openpyxl
