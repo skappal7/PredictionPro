@@ -1,11 +1,9 @@
 # app.py
 """
 Predictive Analytics Streamlit App — HTML-embedded profiling & dashboard
-- Profiling and ExplainerDashboard are exported to standalone HTML files, then embedded via components.html()
-- Separate SHAP visuals removed — ExplainerDashboard provides SHAP & contributions when available
-- If ExplainerDashboard cannot be built (e.g., Plotly property mismatch), fallback metrics/charts are displayed (no SHAP visuals)
-- Defensive sanitization for profiling to avoid profiler crashes
-- Safe filename handling, fixed f-strings, and clear guidance messages
+- Profiling and ExplainerDashboard exported to standalone HTML files, then embedded via components.html()
+- Explainer dashboard builder is robust: it attempts to compute/normalize SHAP values (2D) and uses the right export API.
+- Defensive: many try/except paths and helpful error messages so app falls back to diagnostics when needed.
 """
 
 import io
@@ -81,7 +79,7 @@ except Exception:
     SMOTE = RandomOverSampler = RandomUnderSampler = None
     IMB_AVAILABLE = False
 
-# SHAP (not used separately any more; dashboard provides SHAP)
+# SHAP (not used separately any more; dashboard provides SHAP if available)
 try:
     import shap
     SHAP_AVAILABLE = True
@@ -222,10 +220,11 @@ def generate_profile_html_file(df: pd.DataFrame, tmp_dir: Optional[str] = None) 
         fd_path = fd.name
         fd.close()
         try:
+            # some versions support to_file
             profile.to_file(fd_path)
             return fd_path
         except Exception:
-            # some versions may not support to_file; fallback to to_html string and write
+            # fallback to to_html string and write
             html_str = profile.to_html()
             with open(fd_path, "w", encoding="utf-8") as fh:
                 fh.write(html_str)
@@ -261,62 +260,236 @@ def generate_profile_html_file(df: pd.DataFrame, tmp_dir: Optional[str] = None) 
                 fh.write("<h3>Profiling generation failed and fallback generation also failed.</h3>")
             return fd.name
 
+# -------------------------
+# NEW: robust SHAP normalizer + ExplainerDashboard exporter
+# -------------------------
+def _normalize_shap_values(shap_values_raw, n_samples):
+    """
+    Normalize various SHAP return shapes to a numpy array, and return a 2D shap array if possible.
+    Acceptable inputs:
+      - list of arrays: [ (n_samples, n_features), ... ]  -> stacked
+      - numpy array of shape (n_samples, n_classes, n_features)
+      - numpy array of shape (n_classes, n_samples, n_features)
+      - numpy array of shape (n_samples, n_features)
+    Returns:
+      - shap_2d (np.ndarray) shape (n_samples, n_features)
+      - metadata dict with keys: {'original_shape': ..., 'selected_class_index': int or None}
+    Strategy:
+      - If multiple-class SHAP available, pick the class with largest mean absolute SHAP (most important),
+        to produce a representative single-class explanation.
+    """
+    meta = {"original_shape": None, "selected_class_index": None}
+    if shap_values_raw is None:
+        return None, meta
+
+    # If list of arrays (common older shap outputs): stack into array (n_classes, n_samples, n_features)
+    try:
+        if isinstance(shap_values_raw, list):
+            arrs = [np.asarray(a) for a in shap_values_raw]
+            # typical list element shape: (n_samples, n_features)
+            # stack -> (n_classes, n_samples, n_features)
+            stacked = np.stack(arrs, axis=0)
+            meta["original_shape"] = stacked.shape
+            # transpose -> (n_samples, n_classes, n_features)
+            stacked = np.transpose(stacked, (1, 0, 2))
+            arr = stacked
+        else:
+            arr = np.asarray(shap_values_raw)
+            meta["original_shape"] = arr.shape
+            # if arr has shape (n_classes, n_samples, n_features) -> transpose
+            if arr.ndim == 3 and arr.shape[0] != n_samples and arr.shape[1] == n_samples:
+                # (n_classes, n_samples, n_features) -> (n_samples, n_classes, n_features)
+                arr = np.transpose(arr, (1, 0, 2))
+            # if arr has shape (n_samples, n_features, n_classes) -> transpose to (n_samples, n_classes, n_features)
+            if arr.ndim == 3 and arr.shape[0] == n_samples and arr.shape[2] != arr.shape[1] and arr.shape[2] != n_samples:
+                # common alternative: (n_samples, n_features, n_classes) -> swap axes
+                # only done if it looks like the 3rd axis is classes
+                try:
+                    arr = np.transpose(arr, (0, 2, 1))
+                except Exception:
+                    pass
+    except Exception:
+        return None, meta
+
+    # If arr is already 2D -> return directly
+    if arr.ndim == 2:
+        meta["original_shape"] = arr.shape
+        return arr, meta
+
+    # If arr is 3D -> try to identify (n_samples, n_classes, n_features)
+    if arr.ndim == 3:
+        if arr.shape[0] == n_samples:
+            n_classes = arr.shape[1]
+            n_features = arr.shape[2]
+            # choose the class with largest mean absolute shap across samples & features
+            mean_abs_per_class = np.mean(np.abs(arr), axis=(0, 2))
+            class_idx = int(np.argmax(mean_abs_per_class))
+            meta["selected_class_index"] = class_idx
+            shap_2d = arr[:, class_idx, :]
+            meta["original_shape"] = arr.shape
+            return shap_2d, meta
+        else:
+            # fallback: attempt to flatten last axis
+            try:
+                flattened = arr.reshape(n_samples, -1)
+                meta["original_shape"] = arr.shape
+                return flattened, meta
+            except Exception:
+                return None, meta
+
+    # unknown shape
+    return None, meta
+
 def generate_explainer_dashboard_html_file(fitted_clf, X_sample: pd.DataFrame, y_sample: np.ndarray, class_names: Optional[list] = None, tmp_dir: Optional[str] = None) -> str:
     """
     Attempt to build an ExplainerDashboard and write to an HTML file. Return file path.
-    If ExplainerDashboard is not available, raise Exception.
+    This version:
+      - tries to compute SHAP values robustly (handles list or 3D arrays)
+      - selects a representative class automatically if multiclass SHAP returned
+      - passes 2D shap_values into ClassifierExplainer to avoid inside-constructor crashes
+      - uses to_html(fd_path) or to_file(fd_path) according to availability
     """
     if not EXPLAINERDASH_AVAILABLE:
         raise RuntimeError("explainerdashboard not installed in environment.")
-    expl = ClassifierExplainer(fitted_clf, X_sample, y_sample, labels=class_names if class_names else None, model_output="probability")
-    dashboard = ExplainerDashboard(
-        expl,
-        title="Model Performance Dashboard",
-        bootstrap="FLATLY",
-        whatif=True,
-        importances=True,
-        model_summary=True,
-        contributions=True,
-        shap_dependence=True,
-        shap_interaction=True,
-        decision_trees=isinstance(fitted_clf, DecisionTreeClassifier),
-        hide_poweredby=True,
-        fluid=True,
-    )
+
+    # prepare temporary file
     fd = tempfile.NamedTemporaryFile(delete=False, suffix=".html", dir=tmp_dir)
     fd_path = fd.name
     fd.close()
-    # to_file preferred; catch exceptions from construction/export
-    try:
-        dashboard.to_file(fd_path)
-        return fd_path
-    except Exception:
-        # older versions sometimes need to_html or to_html(filename=...)
+
+    explainer_obj = None
+    dashboard = None
+
+    # First: attempt to compute SHAP values externally if shap is available
+    shap_values_2d = None
+    shap_meta = {"original_shape": None, "selected_class_index": None}
+    if SHAP_AVAILABLE:
         try:
-            dashboard.to_html(filename=fd_path)
-            return fd_path
+            # Best-effort: try shap.Explainer (newer API) then fallback to TreeExplainer
+            try:
+                # shap.Explainer often handles many model types
+                shap_expl = shap.Explainer(fitted_clf, X_sample)
+                shap_values_raw = shap_expl(X_sample).values
+            except Exception:
+                # fallback: TreeExplainer / older API
+                try:
+                    shap_values_raw = shap.TreeExplainer(fitted_clf).shap_values(X_sample)
+                except Exception:
+                    shap_values_raw = None
+
+            if shap_values_raw is not None:
+                shap_values_2d, shap_meta = _normalize_shap_values(shap_values_raw, n_samples=X_sample.shape[0])
+        except Exception:
+            # suppress shap computation errors; we'll let ClassifierExplainer try if needed
+            shap_values_2d = None
+            shap_meta = {"original_shape": None, "selected_class_index": None}
+
+    # Now attempt to construct the ClassifierExplainer.
+    # Prefer to pass precomputed shap_values_2d to avoid internal SHAP computation that may produce 3D arrays.
+    try:
+        if shap_values_2d is not None:
+            expl = ClassifierExplainer(fitted_clf, X_sample, y_sample, labels=class_names if class_names else None, model_output="probability", shap_values=shap_values_2d)
+        else:
+            # no safe shap precomputed — let explainerdashboard attempt; we'll catch 3D-shap assertion below
+            expl = ClassifierExplainer(fitted_clf, X_sample, y_sample, labels=class_names if class_names else None, model_output="probability")
+    except AssertionError as ae:
+        # Sometimes the ClassifierExplainer asserts right away about shap shapes — attempt to recover by passing a flattened/single-class shap
+        try:
+            if SHAP_AVAILABLE:
+                # re-attempt compute -> normalize again but more aggressively
+                try:
+                    shap_values_raw = shap.TreeExplainer(fitted_clf).shap_values(X_sample)
+                except Exception:
+                    shap_values_raw = None
+                if shap_values_raw is not None:
+                    shap_values_2d, shap_meta = _normalize_shap_values(shap_values_raw, n_samples=X_sample.shape[0])
+                    if shap_values_2d is not None:
+                        expl = ClassifierExplainer(fitted_clf, X_sample, y_sample, labels=class_names if class_names else None, model_output="probability", shap_values=shap_values_2d)
+                    else:
+                        raise
+                else:
+                    raise
+            else:
+                raise
         except Exception as e:
-            # bubble up exception for caller fallback handling
+            # bubble original assertion if we cannot fix
+            raise ae from e
+    except Exception:
+        # any other constructor failure -> re-raise for outer handler
+        raise
+
+    # Create the dashboard object with a conservative config
+    try:
+        dashboard = ExplainerDashboard(
+            expl,
+            title="Model Performance Dashboard",
+            bootstrap="FLATLY",
+            whatif=True,
+            importances=True,
+            model_summary=True,
+            contributions=True,
+            shap_dependence=True,
+            shap_interaction=True,
+            decision_trees=isinstance(fitted_clf, DecisionTreeClassifier),
+            hide_poweredby=True,
+            fluid=True,
+        )
+    except Exception:
+        # If constructing dashboard still fails (perhaps due to internal shap shape checks),
+        # try to repair expl by forcing expl.shap_values to the 2D version if we have it.
+        try:
+            if SHAP_AVAILABLE and shap_values_2d is not None:
+                # set attribute if available (best-effort)
+                try:
+                    expl.shap_values = shap_values_2d
+                except Exception:
+                    pass
+                # reattempt dashboard creation
+                dashboard = ExplainerDashboard(
+                    expl,
+                    title="Model Performance Dashboard",
+                    bootstrap="FLATLY",
+                    whatif=True,
+                    importances=True,
+                    model_summary=True,
+                    contributions=True,
+                    shap_dependence=True,
+                    shap_interaction=True,
+                    decision_trees=isinstance(fitted_clf, DecisionTreeClassifier),
+                    hide_poweredby=True,
+                    fluid=True,
+                )
+            else:
+                raise
+        except Exception as e:
+            # give up and propagate the last error for caller to handle
             raise
 
-def patch_html_titlefont_workaround(html_str: str) -> str:
-    """
-    Best-effort PATCH to replace common Plotly layout property names that older/newer Plotly versions disagree on,
-    e.g., titlefont -> title_font. This operates on the generated HTML string.
-    Note: If error originates during dashboard construction (not after HTML creation), this will not help.
-    """
-    if not isinstance(html_str, str):
-        return html_str
-    s = html_str
-    # JSON-style "titlefont": { -> "title_font": {
-    s = re.sub(r'("titlefont"\s*:\s*)\{', r'"title_font": {', s)
-    # JS-style .titlefont = { -> .title_font = {
-    s = re.sub(r'(\.titlefont\s*=\s*)\{', r'.title_font = {', s)
-    # property references
-    s = re.sub(r'\.titlefont\b', r'.title_font', s)
-    # key without quotes: titlefont: { -> title_font: {
-    s = re.sub(r'(\btitlefont\s*:\s*)\{', r'title_font: {', s)
-    return s
+    # Export the dashboard to HTML. Different explainerdashboard versions differ in method names/args.
+    try:
+        # Prefer to_html(path) signature
+        try:
+            dashboard.to_html(fd_path)
+            return fd_path
+        except TypeError:
+            # fallback: older signature may accept no args or use to_file
+            # try to_file first
+            try:
+                dashboard.to_file(fd_path)
+                return fd_path
+            except Exception:
+                # final fallback: try to_html() returning string
+                html_str = dashboard.to_html()
+                if isinstance(html_str, str) and html_str.strip():
+                    with open(fd_path, "w", encoding="utf-8") as fh:
+                        fh.write(html_str)
+                    return fd_path
+                else:
+                    # if nothing worked, raise
+                    raise RuntimeError("Unable to export dashboard to HTML with available methods.")
+    except Exception:
+        # bubble up to caller
+        raise
 
 def safe_onehot_encoder():
     try:
@@ -553,7 +726,7 @@ with tab2:
 # -------------------------
 with tab3:
     st.header("🔍 Model Evaluation & Explainer")
-    st.markdown("If available, ExplainerDashboard will be exported to a standalone HTML and embedded here. If not available or if dashboard construction fails, the app will show fallback diagnostics (no separate SHAP visuals).")
+    st.markdown("If available, ExplainerDashboard will be exported to a standalone HTML and embedded here. If not available or if dashboard construction fails, the app will show fallback diagnostics (no SHAP visuals).")
 
     if not st.session_state.data_uploaded:
         st.info("👈 Upload data first.")
@@ -664,7 +837,7 @@ with tab3:
                     # Attempt to generate dashboard HTML file
                     try:
                         dashboard_html_path = generate_explainer_dashboard_html_file(fitted_clf, X_dash, y_dash, class_names=class_names)
-                        # Read and optionally patch HTML if needed
+                        # Read and optionally patch HTML if needed (titlefont -> title_font)
                         with open(dashboard_html_path, "r", encoding="utf-8") as fh:
                             dashboard_html = fh.read()
                         # best-effort patch for property name mismatches (titlefont -> title_font)
@@ -788,7 +961,7 @@ with tab3:
                     else:
                         st.info("No predict_proba available for ROC/PR.")
                 except Exception:
-                    st.info("ROC/PR generation failed.")
+                    st.info("ROC/PR generation failed. ")
 
             st.markdown("---")
             # Partial Dependence Plot (approx) — keep as a small, helpful diagnostic
