@@ -90,9 +90,9 @@ except Exception:
 # -------------------------
 # Page config & session defaults
 # -------------------------
-st.set_page_config(page_title="Predictive Analytics App", layout="wide", page_icon="📊")
-st.title("📊 Predictive Analytics — Embedded Profiling & ExplainerDashboard (static HTML)")
-st.markdown("Upload → Profile → Train → Export ExplainerDashboard to static HTML → Embed → Predict")
+st.set_page_config(page_title="Prediction Pro", layout="wide", page_icon="📊")
+st.title("📊 Predictive Analytics — CE Innovation Labs")
+st.markdown("Upload → Profile → Train → Explain → Deploy → Predict")
 
 _session_defaults = {
     "data_uploaded": False,
