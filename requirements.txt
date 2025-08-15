@@ -1,23 +1,17 @@
-# Data Manipulation and Analysis
-pandas==2.2.0
-numpy==1.26.0
-
-# Profiling and Visualization
-ydata-profiling==4.5.1
-matplotlib==3.8.2
-seaborn==0.13.2
-plotly==5.18.0
-
-# Machine Learning
-scikit-learn==1.3.2
-imbalanced-learn==0.11.0
-
-# Explainability
-shap==0.45.0
+streamlit>=1.41.0
+streamlit-components-v1>=0.1.0
+pandas>=2.3.0
+numpy>=2.1.0
+ydata-profiling>=4.5.1
+scikit-learn>=1.5.0
+imbalanced-learn>=0.14.0
+explainerdashboard==0.4.0
+shap>=0.48.0
 lime==0.2.0.0
-
-# File Handling and Utilities
-openpyxl==3.1.3
-xlsxwriter==3.2.0
-joblib==1.3.2
-pathlib2==2.3.7.post1
+matplotlib>=3.10.0
+seaborn>=0.13.2
+openpyxl>=3.1.3
+xlsxwriter>=3.2.0
+pathlib2>=2.3.7.post1
+joblib>=1.5.0
+plotly>=6.3.0
