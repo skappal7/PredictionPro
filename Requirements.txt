@@ -1,10 +1,9 @@
 streamlit
 pandas
 numpy
-scikit-learn
-imbalanced-learn
-explainerdashboard
-ydata-profiling
-shap
 matplotlib
-openpyxl
+seaborn
+scikit-learn
+plotly
+ydata-profiling
+pyarrow
