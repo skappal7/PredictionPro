@@ -1,13 +1,14 @@
 # app.py
-# Predictive Analytics App (complete) — Streamlit
+# Predictive Analytics App with Comprehensive ExplainerDashboard
 # - No reset logic
 # - Data persists across tabs
 # - Profiling enabled (ydata-profiling fallback)
 # - Auto-select random index for explainer
 # - Robust SHAP contributions logic (no length mismatch)
-# - Small compact charts with 10pt fonts
+# - Compact charts & fonts (≈10pt)
+# - Comprehensive ExplainerDashboard integration (per docs)
 #
-# Ensure requirements.txt includes (minimum):
+# Requirements (put in requirements.txt for Streamlit Cloud):
 # streamlit
 # pandas
 # numpy
@@ -27,9 +28,10 @@ plt.rcParams.update({
     "font.size": 10,
     "axes.titlesize": 10,
     "axes.labelsize": 10,
-    "xtick.labelsize": 10,
-    "ytick.labelsize": 10,
+    "xtick.labelsize": 9,
+    "ytick.labelsize": 9,
     "legend.fontsize": 9,
+    "savefig.dpi": 110,
 })
 
 import streamlit as st
@@ -70,7 +72,7 @@ from imblearn.under_sampling import RandomUnderSampler
 # SHAP
 import shap
 
-# Optional Explainer Dashboard
+# ExplainerDashboard (optional)
 try:
     from explainerdashboard import ClassifierExplainer, ExplainerDashboard
     EXPLAINERDASH_AVAILABLE = True
@@ -82,7 +84,7 @@ except Exception:
 # -----------------------------
 st.set_page_config(page_title="Predictive Analytics App", layout="wide", page_icon="📊")
 
-# Session state initialization (persistence)
+# Session state initialization
 if 'data_uploaded' not in st.session_state:
     st.session_state.data_uploaded = False
 if 'profile_generated' not in st.session_state:
@@ -106,34 +108,33 @@ def class_counts(y_arr):
     return {str(k): int(v) for k, v in vc.items()}
 
 @st.cache_data
-def load_data_from_file(uploaded_file):
-    if uploaded_file is None:
-        return None
-    try:
+def load_data(uploaded_file):
+    if uploaded_file:
         if uploaded_file.name.endswith(".csv"):
             return pd.read_csv(uploaded_file)
         else:
             return pd.read_excel(uploaded_file)
-    except Exception as e:
-        raise
+    return None
 
 @st.cache_data
-def generate_profile_report_html(data):
+def generate_profile_report(data):
+    """Generate YData Profiling report"""
     if ProfileReport is None:
-        return "<h3>Data profiling library not available</h3><p>Please add 'ydata-profiling' to requirements.txt</p>"
-    profile = ProfileReport(data, title="Dataset Profiling Report", explorative=True, minimal=False)
+        return "<h1>Data Profiling library not available</h1><p>Please install ydata-profiling or pandas-profiling</p>"
+
+    profile = ProfileReport(
+        data,
+        title="Dataset Profiling Report",
+        explorative=True,
+        minimal=False
+    )
     return profile.to_html()
 
 def safe_shap_explainer(fitted_model, background_data, feature_names=None):
-    """
-    Return a shap.Explainer instance robustly.
-    """
     try:
         if feature_names is not None:
-            expl = shap.Explainer(fitted_model, background_data, feature_names=feature_names)
-        else:
-            expl = shap.Explainer(fitted_model, background_data)
-        return expl
+            return shap.Explainer(fitted_model, background_data, feature_names=feature_names)
+        return shap.Explainer(fitted_model, background_data)
     except Exception:
         try:
             return shap.Explainer(fitted_model, background_data)
@@ -141,46 +142,32 @@ def safe_shap_explainer(fitted_model, background_data, feature_names=None):
             return None
 
 def ensure_shap_array_for_idx(shap_values_obj, idx):
-    """
-    From a shap.Explanation or numpy array, safely extract contribution vector for row idx.
-    Returns a 1D numpy array or None.
-    """
     try:
-        # If shap_values_obj is numpy array of shape (n_samples, n_features)
         if isinstance(shap_values_obj, np.ndarray):
             arr = shap_values_obj
             if arr.ndim == 2:
                 return arr[idx].ravel()
             if arr.ndim == 3:
-                # sometimes (n_samples, n_outputs, n_features) -> choose first sample's first output if ambiguous
-                if arr.shape[0] == idx + 1:
-                    # pick sample idx
+                if arr.shape[0] > idx:
                     s = arr[idx]
                     if s.ndim == 2:
-                        # choose output with largest absolute mean
                         out_idx = int(np.argmax(np.abs(s).mean(axis=1)))
                         return s[out_idx].ravel()
-                    else:
-                        return s.ravel()
+                    return s.ravel()
                 else:
-                    # fallback to first sample
                     return arr[0].ravel()
             if arr.ndim == 1:
                 return arr.ravel()
         else:
-            # shap.Explanation object
             try:
-                values = shap_values_obj.values  # could be array-like or nested
+                vals = shap_values_obj.values
             except Exception:
-                values = shap_values_obj
-            # values might be (n_samples, n_features) or (n_samples, n_outputs, n_features)
-            vals = np.array(values)
+                vals = shap_values_obj
+            vals = np.array(vals)
             if vals.ndim == 2:
                 return vals[idx].ravel()
             if vals.ndim == 3:
-                # pick class with biggest absolute impact for the selected sample (if predict_proba available we could use class idx)
-                sample_vals = vals[idx]  # shape (n_outputs, n_features)
-                # choose output row with largest absolute mean
+                sample_vals = vals[idx]
                 out_idx = int(np.argmax(np.abs(sample_vals).mean(axis=1)))
                 return sample_vals[out_idx].ravel()
             if vals.ndim == 1:
@@ -189,10 +176,6 @@ def ensure_shap_array_for_idx(shap_values_obj, idx):
         return None
 
 def make_pdp_values(clf_pipeline, base_row_df, feature, grid):
-    """
-    Given a pipeline and a base row as DataFrame, vary `feature` across `grid`,
-    return list of predictions / probabilities robustly.
-    """
     preds = []
     for v in grid:
         temp = base_row_df.copy()
@@ -200,7 +183,6 @@ def make_pdp_values(clf_pipeline, base_row_df, feature, grid):
         try:
             if hasattr(clf_pipeline, "predict_proba"):
                 p = clf_pipeline.predict_proba(temp)
-                # choose highest probability value
                 preds.append(float(np.max(p)))
             else:
                 p = clf_pipeline.predict(temp)
@@ -209,36 +191,45 @@ def make_pdp_values(clf_pipeline, base_row_df, feature, grid):
             preds.append(np.nan)
     return preds
 
+def st_plt(fig):
+    st.pyplot(fig)
+
 # -----------------------------
-# Main layout: Title + Sidebar - Upload
+# Main UI
 # -----------------------------
 st.title("📊 Predictive Analytics Application")
-st.markdown("Comprehensive platform for profiling, model-building, evaluation, and predictions.")
+st.markdown("A comprehensive platform for data analysis, model development, evaluation, and predictions.")
 
+# Sidebar - upload
 with st.sidebar:
     st.header("📁 Data Upload")
-    uploaded_file = st.file_uploader("Choose your dataset (CSV or XLSX)", type=["csv", "xlsx"])
+    st.markdown("Upload your dataset to begin the analysis workflow.")
+    uploaded_file = st.file_uploader("Choose your dataset", type=["csv", "xlsx"], help="Upload a CSV or Excel file containing your dataset")
     st.markdown("---")
-    st.write("App status:")
+    st.write("Status:")
     st.write(f"Data uploaded: {st.session_state.data_uploaded}")
     st.write(f"Model trained: {st.session_state.model_trained}")
 
-# Handle file upload & persistence (no resets)
 if uploaded_file:
     try:
-        data = load_data_from_file(uploaded_file)
+        data = load_data(uploaded_file)
         st.session_state.data = data
         st.session_state.data_uploaded = True
         st.session_state.current_file = uploaded_file.name
-        st.success("✅ Data uploaded and stored in session.")
-        st.write(f"**Shape:** {data.shape} | **Columns:** {len(data.columns)}")
+        st.success("✅ Data uploaded successfully!")
+        st.write(f"**Shape:** {data.shape}")
+        st.write(f"**Columns:** {len(data.columns)}")
+        with st.expander("Quick Preview"):
+            st.dataframe(data.head(3))
     except Exception as e:
         st.error(f"Failed to load uploaded file: {e}")
         st.session_state.data_uploaded = False
+else:
+    # keep previous data if present
+    if st.session_state.data is None:
+        st.session_state.data_uploaded = False
 
-# -----------------------------
 # Tabs
-# -----------------------------
 tab1, tab2, tab3, tab4 = st.tabs([
     "📊 Data Profiling",
     "🚀 Model Development",
@@ -251,7 +242,14 @@ tab1, tab2, tab3, tab4 = st.tabs([
 # -----------------------------
 with tab1:
     st.header("📊 Data Profiling")
-    st.markdown("Understand your dataset before modeling.")
+    st.markdown("""
+    **What is Data Profiling?**
+    Data profiling provides comprehensive insights into your dataset including:
+    - Data types and missing values analysis
+    - Statistical summaries and distributions
+    - Correlation analysis between variables
+    - Data quality assessment and anomaly detection
+    """)
     if not st.session_state.data_uploaded:
         st.info("👈 Please upload a dataset in the sidebar to begin profiling.")
     else:
@@ -271,11 +269,11 @@ with tab1:
             st.dataframe(data.head(5))
         if st.button("🔍 Generate Comprehensive Profile Report"):
             if ProfileReport is None:
-                st.error("Data profiling library not installed. Add 'ydata-profiling' to requirements.txt and redeploy.")
+                st.error("Data profiling library not installed. Please add 'ydata-profiling' to requirements.txt")
             else:
                 with st.spinner("Generating profiling report..."):
                     try:
-                        html = generate_profile_report_html(data)
+                        html = generate_profile_report(data)
                         st.session_state.profile_html = html
                         st.session_state.profile_generated = True
                         st.success("✅ Profile generated.")
@@ -290,8 +288,11 @@ with tab1:
 # -----------------------------
 with tab2:
     st.header("🚀 Model Development")
+    st.markdown("""
+    Select target, features, algorithm, balance classes, and train the model.
+    """)
     if not st.session_state.data_uploaded:
-        st.info("👈 Upload a dataset first.")
+        st.info("👈 Please upload a dataset first.")
     else:
         data = st.session_state.data.copy()
         st.subheader("🎯 Target & Feature Selection")
@@ -309,12 +310,11 @@ with tab2:
         else:
             feature_cols = available_features
         st.session_state.previous_features = feature_cols
-
         st.info(f"Selected {len(feature_cols)} features.")
+
         X = data[feature_cols].copy()
         y_raw = data[target_column].copy()
 
-        # Encode target if categorical
         if y_raw.dtype == "object" or y_raw.nunique() < 20:
             le_target = LabelEncoder()
             y = le_target.fit_transform(y_raw.astype(str))
@@ -325,10 +325,10 @@ with tab2:
             class_names = [str(c) for c in np.unique(y)]
 
         st.subheader("📊 Target Distribution")
-        colA, colB = st.columns(2)
-        with colA:
+        a1, a2 = st.columns(2)
+        with a1:
             st.write(class_counts(y))
-        with colB:
+        with a2:
             try:
                 dist_df = pd.DataFrame(list(class_counts(y).items()), columns=['class', 'count']).set_index('class')
                 st.bar_chart(dist_df)
@@ -371,7 +371,6 @@ with tab2:
         st.subheader("📊 Train/Test Split")
         test_pct = st.slider("Test size (%)", 10, 50, 20)
 
-        # Build preprocessing
         numeric_feats = X.select_dtypes(include=np.number).columns.tolist()
         categorical_feats = X.select_dtypes(exclude=np.number).columns.tolist()
         numeric_transformer = Pipeline([("scaler", StandardScaler())])
@@ -381,7 +380,6 @@ with tab2:
             ("cat", categorical_transformer, categorical_feats),
         ])
 
-        # Pipeline with optional sampler
         if sampler is None:
             clf_pipeline = ImbPipeline(steps=[("preprocessor", preprocessor), ("classifier", model)])
         else:
@@ -389,7 +387,6 @@ with tab2:
 
         st.markdown("---")
         if st.button("🚀 Train Model", use_container_width=True):
-            # Validate
             unique, counts = np.unique(y, return_counts=True)
             if len(unique) < 2:
                 st.error("Need at least 2 classes/values in target to train.")
@@ -401,7 +398,6 @@ with tab2:
                         clf_pipeline.fit(X_train, y_train)
                         y_pred = clf_pipeline.predict(X_test)
                         acc = accuracy_score(y_test, y_pred)
-                        # Store model and test splits in session state
                         st.session_state.model_trained = True
                         st.session_state.trained_clf = clf_pipeline
                         st.session_state.trained_le_target = le_target
@@ -412,7 +408,6 @@ with tab2:
                             'y_pred': np.array(y_pred),
                             'accuracy': float(acc)
                         }
-                        # Save test dataframe (reset index)
                         st.session_state.trained_X_test = X_test.reset_index(drop=True)
                         st.session_state.trained_y_test = np.array(y_test)
                         st.success(f"✅ Trained. Accuracy: {acc:.3f}")
@@ -421,10 +416,13 @@ with tab2:
                         st.text(traceback.format_exc())
 
 # -----------------------------
-# TAB 3: Model Evaluation (Explainer + SHAP + PDP)
+# TAB 3: Model Evaluation (Explainer + SHAP + PDP + ExplainerDashboard)
 # -----------------------------
 with tab3:
     st.header("🔍 Model Evaluation & Explainer")
+    st.markdown("""
+    Model performance metrics, SHAP-style contributions, PDP, and a full ExplainerDashboard (if available).
+    """)
     if not st.session_state.data_uploaded:
         st.info("👈 Upload data first.")
     elif not st.session_state.model_trained:
@@ -439,16 +437,15 @@ with tab3:
 
         # Performance summary
         st.subheader("📊 Performance Summary")
-        c1, c2, c3 = st.columns(3)
-        with c1:
+        p1, p2, p3 = st.columns(3)
+        with p1:
             st.metric("Accuracy", f"{test_results['accuracy']:.3f}")
-        with c2:
+        with p2:
             st.metric("Test samples", len(y_test_arr))
-        with c3:
+        with p3:
             st.metric("Features", len(st.session_state.trained_feature_cols))
 
-        # Detailed classification report (if classification)
-        st.subheader("📋 Performance Report")
+        st.subheader("📋 Detailed Performance Report")
         try:
             report = classification_report(y_test_arr, test_results['y_pred'], output_dict=True, target_names=class_names)
             report_df = pd.DataFrame(report).transpose().round(3)
@@ -475,12 +472,10 @@ with tab3:
                             value=int(st.session_state.explainer_selected_index), step=1)
             st.session_state.explainer_selected_index = int(idx)
 
-            # Columns for selection + prediction display
             sel_col, pred_col = st.columns([1, 2])
             with sel_col:
                 st.markdown("### Selected index")
                 st.write(f"**{idx}**")
-                st.write("")
             with pred_col:
                 st.markdown("### Prediction")
                 try:
@@ -516,11 +511,9 @@ with tab3:
                     st.text(traceback.format_exc())
 
             st.markdown("---")
-            # Contributions Plot (SHAP)
+            # Contributions (SHAP-style)
             st.markdown("### Contributions (SHAP-style)")
             try:
-                # Build preprocessed background for SHAP
-                # Use a small background sample to speed up
                 try:
                     preprocessor = clf_pipeline.named_steps.get("preprocessor", None)
                     fitted_clf = clf_pipeline.named_steps.get("classifier", clf_pipeline)
@@ -528,19 +521,16 @@ with tab3:
                     preprocessor = None
                     fitted_clf = clf_pipeline
 
-                # Build background as preprocessor applied to sample of X_test_df
                 background_rows = X_test_df.sample(min(len(X_test_df), 200), replace=False)
-                # If preprocessor exists, transform background for faster TreeExplainer
+
                 try:
                     if preprocessor is not None:
                         background_trans = preprocessor.transform(background_rows)
                     else:
                         background_trans = background_rows.values
                 except Exception:
-                    # fallback: use raw background values
                     background_trans = background_rows.values
 
-                # Feature names for SHAP values: try to extract from preprocessor
                 try:
                     if preprocessor is not None and hasattr(preprocessor, "get_feature_names_out"):
                         feat_names = preprocessor.get_feature_names_out()
@@ -549,41 +539,32 @@ with tab3:
                 except Exception:
                     feat_names = X_test_df.columns.tolist()
 
-                # Create explainer robustly
                 shap_explainer = safe_shap_explainer(fitted_clf, background_trans, feature_names=feat_names)
                 shap_vals_vector = None
                 if shap_explainer is not None:
                     try:
-                        # We need preprocessed single instance if explainer expects transformed input
-                        try:
-                            if preprocessor is not None:
-                                single_proc = preprocessor.transform(X_test_df.iloc[[idx]])
-                            else:
-                                single_proc = X_test_df.iloc[[idx]].values
-                        except Exception:
+                        if preprocessor is not None:
+                            single_proc = preprocessor.transform(X_test_df.iloc[[idx]])
+                        else:
                             single_proc = X_test_df.iloc[[idx]].values
-
+                    except Exception:
+                        single_proc = X_test_df.iloc[[idx]].values
+                    try:
                         shap_vals = shap_explainer(single_proc)
-                        shap_vals_vector = ensure_shap_array_for_idx(shap_vals, 0)  # single_proc is single sample, idx=0
+                        shap_vals_vector = ensure_shap_array_for_idx(shap_vals, 0)
                     except Exception:
                         shap_vals_vector = None
 
-                # If shap_vals_vector None, attempt fallback: use shap.TreeExplainer on fitted_clf directly with raw X_test_df
                 if shap_vals_vector is None:
                     try:
-                        try:
-                            tree_expl = shap.TreeExplainer(fitted_clf)
-                            shap_vals_raw = tree_expl.shap_values(X_test_df)
-                            shap_vals_vector = ensure_shap_array_for_idx(shap_vals_raw, idx)
-                        except Exception:
-                            shap_vals_vector = None
+                        tree_expl = shap.TreeExplainer(fitted_clf)
+                        shap_vals_raw = tree_expl.shap_values(X_test_df)
+                        shap_vals_vector = ensure_shap_array_for_idx(shap_vals_raw, idx)
                     except Exception:
                         shap_vals_vector = None
 
-                # Prepare contributions DataFrame safely
                 if shap_vals_vector is None:
-                    st.info("SHAP values not available for this pipeline/model. Showing feature differences instead.")
-                    # fallback: difference from mean (simple contribution proxy)
+                    st.info("SHAP values not available for this pipeline/model. Showing difference-from-mean as proxy.")
                     base = X_test_df.mean()
                     diff = X_test_df.iloc[idx] - base
                     contrib_df = pd.DataFrame({
@@ -591,21 +572,16 @@ with tab3:
                         "contribution": diff.values
                     })
                 else:
-                    # Ensure shap length matches candidate feature list; pick the best matching feature list
                     contrib = np.asarray(shap_vals_vector).ravel()
-                    # If lengths mismatch, align to one of candidates (prefer feat_names then X_test_df.columns)
                     if len(contrib) == len(feat_names):
                         feat_list = list(feat_names)
                     elif len(contrib) == len(X_test_df.columns):
                         feat_list = list(X_test_df.columns)
                     else:
-                        # If mismatch, try to trim or pad contributions
-                        # Choose feat_list as X_test_df.columns and either slice or pad contrib
                         feat_list = list(X_test_df.columns)
                         if len(contrib) > len(feat_list):
                             contrib = contrib[:len(feat_list)]
                         else:
-                            # pad zeros
                             pad_len = len(feat_list) - len(contrib)
                             contrib = np.concatenate([contrib, np.zeros(pad_len)])
                     contrib_df = pd.DataFrame({
@@ -616,7 +592,6 @@ with tab3:
                 contrib_df["abs_contribution"] = contrib_df["contribution"].abs()
                 contrib_df = contrib_df.sort_values("abs_contribution", ascending=False).reset_index(drop=True)
 
-                # Show top contributions table and compact bar chart
                 st.write("Top contributions (absolute impact)")
                 st.dataframe(contrib_df[["feature", "contribution"]].head(20), use_container_width=True)
 
@@ -625,17 +600,16 @@ with tab3:
                 ax.barh(contrib_df.head(topn)["feature"][::-1], contrib_df.head(topn)["contribution"][::-1])
                 ax.set_xlabel("Contribution (signed)", fontsize=10)
                 ax.set_ylabel("Feature", fontsize=10)
-                ax.tick_params(axis='x', labelsize=10)
-                ax.tick_params(axis='y', labelsize=10)
+                ax.tick_params(axis='x', labelsize=9)
+                ax.tick_params(axis='y', labelsize=9)
                 plt.tight_layout()
-                st.pyplot(fig)
+                st_plt(fig)
 
             except Exception as e:
                 st.error(f"Contributions failed: {e}")
                 st.text(traceback.format_exc())
 
             st.markdown("---")
-            # Partial Dependence Plot (approximate)
             st.markdown("### Partial Dependence Plot (approx)")
             try:
                 numeric_cols = X_test_df.select_dtypes(include=np.number).columns.tolist()
@@ -651,63 +625,75 @@ with tab3:
                     ax.plot(grid, pdp_preds, linewidth=1.8, marker='o', markersize=3)
                     ax.set_xlabel(pdp_feat, fontsize=10)
                     ax.set_ylabel("Predicted output / prob", fontsize=10)
-                    ax.tick_params(axis='x', labelsize=10)
-                    ax.tick_params(axis='y', labelsize=10)
+                    ax.tick_params(axis='x', labelsize=9)
+                    ax.tick_params(axis='y', labelsize=9)
                     plt.tight_layout()
-                    st.pyplot(fig)
+                    st_plt(fig)
             except Exception as e:
                 st.error(f"PDP failed: {e}")
                 st.text(traceback.format_exc())
 
-            # Optionally embed ExplainerDashboard (if available)
+            # Comprehensive ExplainerDashboard embed
             st.markdown("---")
-            st.markdown("### Explainer Dashboard (optional)")
+            st.markdown("### Full ExplainerDashboard (from explainerdashboard)")
             if EXPLAINERDASH_AVAILABLE:
                 try:
+                    # Build sample for dashboard to limit size
                     sample_n = min(1000, len(X_test_df))
                     sample_idx = np.random.choice(len(X_test_df), size=sample_n, replace=False)
                     X_dash = X_test_df.iloc[sample_idx]
                     y_dash = y_test_arr[sample_idx]
-                    # If pipeline, pass fitted classifier and preprocessed X_dash? ExplainerDashboard handles raw X if given classifier that expects transformed input; but behavior varies.
-                    # We'll attempt to create explainer with the classifier (not pipeline) if possible.
+
+                    # Try to pass classifier (not pipeline) and raw X_dash (ExplainerDashboard handles transforms differently across versions)
+                    fitted_clf = clf_pipeline.named_steps.get("classifier", clf_pipeline)
+                    # Create explainer
+                    expl = ClassifierExplainer(
+                        fitted_clf,
+                        X_dash,
+                        y_dash,
+                        labels=class_names,
+                        model_output="probability",
+                    )
+
+                    dashboard = ExplainerDashboard(
+                        expl,
+                        title="Model Performance Dashboard",
+                        bootstrap="FLATLY",
+                        whatif=True,
+                        importances=True,
+                        model_summary=True,
+                        contributions=True,
+                        shap_dependence=True,
+                        shap_interaction=True,
+                        decision_trees=isinstance(fitted_clf, DecisionTreeClassifier),
+                        hide_poweredby=True,
+                        fluid=True,
+                    )
+
                     try:
-                        fitted_clf = clf_pipeline.named_steps.get("classifier", clf_pipeline)
-                        expl = ClassifierExplainer(
-                            fitted_clf,
-                            X_dash,
-                            y_dash,
-                            labels=class_names,
-                            model_output="probability",
-                        )
-                        dashboard = ExplainerDashboard(
-                            expl,
-                            title="Model Performance Dashboard",
-                            shap_interaction=False,
-                            whatif=True,
-                            importances=True,
-                            shap_dependence=True,
-                            decision_trees=isinstance(fitted_clf, DecisionTreeClassifier),
-                        )
-                        try:
-                            html_str = dashboard.to_html()
-                        except TypeError:
-                            with tempfile.TemporaryDirectory() as tmpdir:
-                                html_path = Path(tmpdir) / "db.html"
-                                dashboard.to_html(filename=str(html_path))
-                                html_str = html_path.read_text(encoding="utf-8")
-                        components.html(html_str, height=800, scrolling=True)
-                    except Exception:
-                        st.info("ExplainerDashboard embedding failed for this pipeline/model. The above custom panels provide explanation details.")
-                except Exception:
-                    st.info("ExplainerDashboard not available or failed to render.")
+                        html_str = dashboard.to_html()
+                    except TypeError:
+                        with tempfile.TemporaryDirectory() as tmpdir:
+                            html_path = Path(tmpdir) / "dashboard.html"
+                            dashboard.to_html(filename=str(html_path))
+                            html_str = html_path.read_text(encoding="utf-8")
+
+                    components.html(html_str, height=900, scrolling=True)
+                except Exception as e:
+                    st.error(f"ExplainerDashboard failed to build or render: {e}")
+                    st.info("The custom panels above still provide prediction, contributions, and PDP information.")
+                    st.text(traceback.format_exc())
             else:
-                st.info("ExplainerDashboard library not installed. Add 'explainerdashboard' to requirements if you want the full embedded dashboard.")
+                st.info("ExplainerDashboard not installed. Add 'explainerdashboard' to requirements to enable full dashboard embed.")
 
 # -----------------------------
-# TAB 4: Predictions (new data)
+# TAB 4: Predictions
 # -----------------------------
 with tab4:
-    st.header("📈 Predictions on New Data")
+    st.header("📈 Predictions")
+    st.markdown("""
+    Upload new data (CSV/XLSX) with the same features used in training to get predictions and download results.
+    """)
     if not st.session_state.data_uploaded:
         st.info("👈 Upload data first.")
     elif not st.session_state.model_trained:
@@ -755,7 +741,6 @@ with tab4:
                                 else:
                                     results["prediction"] = preds
                                 if probs is not None:
-                                    # name prob cols
                                     if trained_le_target is not None and hasattr(trained_le_target, "classes_"):
                                         prob_cols = [f"prob_{c}" for c in trained_le_target.classes_]
                                     else:
@@ -774,8 +759,6 @@ with tab4:
                 st.error(f"Failed to load prediction file: {e}")
                 st.text(traceback.format_exc())
 
-# -----------------------------
 # Footer
-# -----------------------------
 st.markdown("---")
-st.markdown("Built with ❤️ using Streamlit | © 2025 CE Team Prediction Pro Analytics App")
+st.markdown("Built with ❤️ using Streamlit | © 2025 CE Team Predictive Analytics Platform")
