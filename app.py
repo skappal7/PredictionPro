@@ -1,15 +1,15 @@
 # app.py
 """
-Predictive Analytics Streamlit App — HTML-embedded profiling & dashboard
-- Profiling and ExplainerDashboard exported to standalone HTML files, then embedded via components.html()
-- Explainer dashboard builder is robust: it attempts to compute/normalize SHAP values (2D) and uses the right export API.
-- Defensive: many try/except paths and helpful error messages so app falls back to diagnostics when needed.
+Predictive Analytics Streamlit App — robust ExplainerDashboard SHAP reshape fix
+- Builds profiling and model pipeline UI.
+- When building ExplainerDashboard: creates ClassifierExplainer (normal ctor),
+  then inspects & normalizes explainer.shap_values in-place if it's 3D.
+- Exports dashboard HTML using available API and embeds via components.html.
 """
 
 import io
 import os
 import re
-import html
 import tempfile
 import traceback
 import random
@@ -36,7 +36,7 @@ import pandas as pd
 import numpy as np
 
 # -------------------------
-# Optional third-party libraries (guarded imports)
+# Guarded / optional imports
 # -------------------------
 # Profiling libs
 try:
@@ -50,7 +50,6 @@ except Exception:
         ProfileReport = None
         PROFILING_LIB = None
 
-# Optional nicer embedding helper (not required)
 try:
     from streamlit_pandas_profiling import st_profile_report
     HAS_ST_PROFILE = True
@@ -79,7 +78,7 @@ except Exception:
     SMOTE = RandomOverSampler = RandomUnderSampler = None
     IMB_AVAILABLE = False
 
-# SHAP (not used separately any more; dashboard provides SHAP if available)
+# SHAP
 try:
     import shap
     SHAP_AVAILABLE = True
@@ -92,6 +91,8 @@ try:
     from explainerdashboard import ClassifierExplainer, ExplainerDashboard
     EXPLAINERDASH_AVAILABLE = True
 except Exception:
+    ClassifierExplainer = None
+    ExplainerDashboard = None
     EXPLAINERDASH_AVAILABLE = False
 
 # -------------------------
@@ -119,7 +120,6 @@ for k, v in _session_defaults.items():
 # Helper functions
 # -------------------------
 def safe_filename_base(name: str) -> str:
-    """Return a safe filename stem (no extension)."""
     base = Path(name).stem
     return re.sub(r"[^A-Za-z0-9_\-]", "_", base)[:128]
 
@@ -128,7 +128,6 @@ def class_counts(y_arr):
     return {str(k): int(v) for k, v in vc.items()}
 
 def load_data_safe(uploaded_file):
-    """Load CSV or Excel safely with fallbacks."""
     try:
         name = uploaded_file.name.lower()
         if name.endswith(".csv"):
@@ -147,22 +146,11 @@ def is_scalar_value(v):
     return not isinstance(v, (list, dict, set, tuple, np.ndarray, pd.Series))
 
 def sanitize_dataframe_for_profiling(df: pd.DataFrame, check_n: int = 50) -> pd.DataFrame:
-    """
-    Sanitize DataFrame for ydata/pandas profiling:
-    - Convert to DataFrame
-    - Drop completely empty columns
-    - Coerce object-like numeric strings
-    - Drop columns with nested/complex values (lists, dicts, arrays)
-    - Drop constant columns (nunique <= 1)
-    - Reset index
-    """
     if df is None:
         return pd.DataFrame()
     if not isinstance(df, pd.DataFrame):
         df = pd.DataFrame(df)
-    # Drop fully empty columns
     df = df.dropna(axis=1, how="all")
-    # Coerce object columns that look numeric
     for col in df.columns:
         if df[col].dtype == object:
             nonnull_sample = df[col].dropna().head(check_n)
@@ -172,7 +160,6 @@ def sanitize_dataframe_for_profiling(df: pd.DataFrame, check_n: int = 50) -> pd.
                     df[col] = pd.to_numeric(df[col], errors="coerce")
             except Exception:
                 pass
-    # Drop nested columns
     drop_cols = []
     for col in df.columns:
         sample_vals = df[col].dropna().head(check_n).tolist()
@@ -182,7 +169,6 @@ def sanitize_dataframe_for_profiling(df: pd.DataFrame, check_n: int = 50) -> pd.
                 break
     if drop_cols:
         df = df.drop(columns=list(set(drop_cols)))
-    # Drop constant columns
     nunique = df.nunique(dropna=False)
     keep_cols = nunique[nunique > 1].index.tolist()
     df = df.loc[:, keep_cols]
@@ -190,20 +176,13 @@ def sanitize_dataframe_for_profiling(df: pd.DataFrame, check_n: int = 50) -> pd.
     return df
 
 def generate_profile_html_file(df: pd.DataFrame, tmp_dir: Optional[str] = None) -> str:
-    """
-    Generate a profiling HTML file and return file path.
-    - Use ProfileReport.to_file if available (safer)
-    - If ProfileReport absent, return an HTML string written to file containing fallback info.
-    """
     if ProfileReport is None:
-        # generate fallback HTML summary and write to temp file
         out_html = "<h3>Profiling library not installed</h3><p>Install 'ydata-profiling' or 'pandas-profiling' to get full reports.</p>"
         fd = tempfile.NamedTemporaryFile(delete=False, suffix=".html", dir=tmp_dir)
         fd.write(out_html.encode("utf-8"))
         fd.close()
         return fd.name
 
-    # sanitize
     df_s = sanitize_dataframe_for_profiling(df)
     if df_s.shape[1] == 0:
         out_html = "<h3>No columns available to profile after sanitization.</h3>"
@@ -213,24 +192,19 @@ def generate_profile_html_file(df: pd.DataFrame, tmp_dir: Optional[str] = None) 
         return fd.name
 
     profile = ProfileReport(df_s, title="Dataset Profiling Report", explorative=True)
-    # prefer to_file when available
     try:
-        # write to temp file
         fd = tempfile.NamedTemporaryFile(delete=False, suffix=".html", dir=tmp_dir)
         fd_path = fd.name
         fd.close()
         try:
-            # some versions support to_file
             profile.to_file(fd_path)
             return fd_path
         except Exception:
-            # fallback to to_html string and write
             html_str = profile.to_html()
             with open(fd_path, "w", encoding="utf-8") as fh:
                 fh.write(html_str)
             return fd_path
     except Exception:
-        # fallback: build minimal HTML summary and write to tmp file
         try:
             parts = []
             parts.append("<h2>Fallback Profiling Report</h2>")
@@ -254,29 +228,19 @@ def generate_profile_html_file(df: pd.DataFrame, tmp_dir: Optional[str] = None) 
                 fh.write(fallback_html)
             return fd.name
         except Exception:
-            # final fallback: very small message
             fd = tempfile.NamedTemporaryFile(delete=False, suffix=".html", dir=tmp_dir)
             with open(fd.name, "w", encoding="utf-8") as fh:
                 fh.write("<h3>Profiling generation failed and fallback generation also failed.</h3>")
             return fd.name
 
 # -------------------------
-# NEW: robust SHAP normalizer + ExplainerDashboard exporter
+# SHAP normalizer (for in-place fix)
 # -------------------------
-def _normalize_shap_values(shap_values_raw, n_samples):
+def _normalize_shap_values_to_2d(shap_values_raw, n_samples):
     """
-    Normalize various SHAP return shapes to a numpy array, and return a 2D shap array if possible.
-    Acceptable inputs:
-      - list of arrays: [ (n_samples, n_features), ... ]  -> stacked
-      - numpy array of shape (n_samples, n_classes, n_features)
-      - numpy array of shape (n_classes, n_samples, n_features)
-      - numpy array of shape (n_samples, n_features)
-    Returns:
-      - shap_2d (np.ndarray) shape (n_samples, n_features)
-      - metadata dict with keys: {'original_shape': ..., 'selected_class_index': int or None}
-    Strategy:
-      - If multiple-class SHAP available, pick the class with largest mean absolute SHAP (most important),
-        to produce a representative single-class explanation.
+    Attempt to convert many SHAP representations into a 2D array (n_samples, n_features).
+    Returns tuple (shap_2d_or_none, meta)
+    meta: {'original_shape': ..., 'selected_class_index': int or None}
     """
     meta = {"original_shape": None, "selected_class_index": None}
     if shap_values_raw is None:
@@ -286,24 +250,20 @@ def _normalize_shap_values(shap_values_raw, n_samples):
     try:
         if isinstance(shap_values_raw, list):
             arrs = [np.asarray(a) for a in shap_values_raw]
-            # typical list element shape: (n_samples, n_features)
-            # stack -> (n_classes, n_samples, n_features)
-            stacked = np.stack(arrs, axis=0)
+            stacked = np.stack(arrs, axis=0)  # (n_classes, n_samples, n_features)
             meta["original_shape"] = stacked.shape
-            # transpose -> (n_samples, n_classes, n_features)
+            # transpose to (n_samples, n_classes, n_features)
             stacked = np.transpose(stacked, (1, 0, 2))
             arr = stacked
         else:
             arr = np.asarray(shap_values_raw)
             meta["original_shape"] = arr.shape
-            # if arr has shape (n_classes, n_samples, n_features) -> transpose
+            # common other shapes -> normalize to (n_samples, n_classes, n_features) if possible
             if arr.ndim == 3 and arr.shape[0] != n_samples and arr.shape[1] == n_samples:
-                # (n_classes, n_samples, n_features) -> (n_samples, n_classes, n_features)
+                # (n_classes, n_samples, n_features)
                 arr = np.transpose(arr, (1, 0, 2))
-            # if arr has shape (n_samples, n_features, n_classes) -> transpose to (n_samples, n_classes, n_features)
+            # (n_samples, n_features, n_classes) -> (n_samples, n_classes, n_features)
             if arr.ndim == 3 and arr.shape[0] == n_samples and arr.shape[2] != arr.shape[1] and arr.shape[2] != n_samples:
-                # common alternative: (n_samples, n_features, n_classes) -> swap axes
-                # only done if it looks like the 3rd axis is classes
                 try:
                     arr = np.transpose(arr, (0, 2, 1))
                 except Exception:
@@ -311,25 +271,24 @@ def _normalize_shap_values(shap_values_raw, n_samples):
     except Exception:
         return None, meta
 
-    # If arr is already 2D -> return directly
+    # If arr is 2D already
     if arr.ndim == 2:
         meta["original_shape"] = arr.shape
         return arr, meta
 
-    # If arr is 3D -> try to identify (n_samples, n_classes, n_features)
+    # If 3D -> choose most important class by mean absolute
     if arr.ndim == 3:
         if arr.shape[0] == n_samples:
             n_classes = arr.shape[1]
-            n_features = arr.shape[2]
-            # choose the class with largest mean absolute shap across samples & features
+            # mean abs per class across samples & features
             mean_abs_per_class = np.mean(np.abs(arr), axis=(0, 2))
             class_idx = int(np.argmax(mean_abs_per_class))
             meta["selected_class_index"] = class_idx
-            shap_2d = arr[:, class_idx, :]
             meta["original_shape"] = arr.shape
+            shap_2d = arr[:, class_idx, :]
             return shap_2d, meta
         else:
-            # fallback: attempt to flatten last axis
+            # fallback: try to flatten last two axes into features
             try:
                 flattened = arr.reshape(n_samples, -1)
                 meta["original_shape"] = arr.shape
@@ -337,88 +296,153 @@ def _normalize_shap_values(shap_values_raw, n_samples):
             except Exception:
                 return None, meta
 
-    # unknown shape
     return None, meta
 
+def _set_explainer_shap_values_inplace(explainer, shap_2d):
+    """
+    Try to set shap values on explainer in place. Different versions store them differently.
+    """
+    set_succeeded = False
+    try:
+        # preferred attribute
+        if hasattr(explainer, "shap_values"):
+            try:
+                setattr(explainer, "shap_values", shap_2d)
+                set_succeeded = True
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # try common internal attr names
+    for attr in ("_shap_values", "shap_values_", "raw_shap_values"):
+        try:
+            if hasattr(explainer, attr):
+                try:
+                    setattr(explainer, attr, shap_2d)
+                    set_succeeded = True
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # Some internal caches may exist — try to clear them if present
+    try:
+        if hasattr(explainer, "_shap_values_df"):
+            try:
+                delattr = False
+                try:
+                    delattr = True
+                    delattr  # just check
+                except Exception:
+                    pass
+                # best-effort: attempt to remove if attribute present
+                if hasattr(explainer, "_shap_values_df"):
+                    try:
+                        delattr(explainer, "_shap_values_df")
+                    except Exception:
+                        # alternative: set to None
+                        try:
+                            setattr(explainer, "_shap_values_df", None)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return set_succeeded
+
+# -------------------------
+# generate_explainer_dashboard_html_file (fixed approach)
+# -------------------------
 def generate_explainer_dashboard_html_file(fitted_clf, X_sample: pd.DataFrame, y_sample: np.ndarray, class_names: Optional[list] = None, tmp_dir: Optional[str] = None) -> str:
     """
-    Attempt to build an ExplainerDashboard and write to an HTML file. Return file path.
-    This version:
-      - tries to compute SHAP values robustly (handles list or 3D arrays)
-      - selects a representative class automatically if multiclass SHAP returned
-      - passes 2D shap_values into ClassifierExplainer to avoid inside-constructor crashes
-      - uses to_html(fd_path) or to_file(fd_path) according to availability
+    Build ExplainerDashboard and write to an HTML file. This function:
+      - constructs ClassifierExplainer normally
+      - inspects explainer.shap_values and normalizes it in-place to 2D if necessary
+      - constructs ExplainerDashboard and exports to HTML using any available export API
     """
-    if not EXPLAINERDASH_AVAILABLE:
+    if not EXPLAINERDASH_AVAILABLE or ClassifierExplainer is None:
         raise RuntimeError("explainerdashboard not installed in environment.")
 
-    # prepare temporary file
+    # prepare temp file
     fd = tempfile.NamedTemporaryFile(delete=False, suffix=".html", dir=tmp_dir)
     fd_path = fd.name
     fd.close()
 
-    explainer_obj = None
-    dashboard = None
-
-    # First: attempt to compute SHAP values externally if shap is available
-    shap_values_2d = None
-    shap_meta = {"original_shape": None, "selected_class_index": None}
-    if SHAP_AVAILABLE:
-        try:
-            # Best-effort: try shap.Explainer (newer API) then fallback to TreeExplainer
-            try:
-                # shap.Explainer often handles many model types
-                shap_expl = shap.Explainer(fitted_clf, X_sample)
-                shap_values_raw = shap_expl(X_sample).values
-            except Exception:
-                # fallback: TreeExplainer / older API
-                try:
-                    shap_values_raw = shap.TreeExplainer(fitted_clf).shap_values(X_sample)
-                except Exception:
-                    shap_values_raw = None
-
-            if shap_values_raw is not None:
-                shap_values_2d, shap_meta = _normalize_shap_values(shap_values_raw, n_samples=X_sample.shape[0])
-        except Exception:
-            # suppress shap computation errors; we'll let ClassifierExplainer try if needed
-            shap_values_2d = None
-            shap_meta = {"original_shape": None, "selected_class_index": None}
-
-    # Now attempt to construct the ClassifierExplainer.
-    # Prefer to pass precomputed shap_values_2d to avoid internal SHAP computation that may produce 3D arrays.
+    # 1) create explainer normally
+    expl = None
     try:
-        if shap_values_2d is not None:
-            expl = ClassifierExplainer(fitted_clf, X_sample, y_sample, labels=class_names if class_names else None, model_output="probability", shap_values=shap_values_2d)
-        else:
-            # no safe shap precomputed — let explainerdashboard attempt; we'll catch 3D-shap assertion below
-            expl = ClassifierExplainer(fitted_clf, X_sample, y_sample, labels=class_names if class_names else None, model_output="probability")
+        expl = ClassifierExplainer(fitted_clf, X_sample, y_sample, labels=class_names if class_names else None, model_output="probability")
     except AssertionError as ae:
-        # Sometimes the ClassifierExplainer asserts right away about shap shapes — attempt to recover by passing a flattened/single-class shap
-        try:
-            if SHAP_AVAILABLE:
-                # re-attempt compute -> normalize again but more aggressively
-                try:
-                    shap_values_raw = shap.TreeExplainer(fitted_clf).shap_values(X_sample)
-                except Exception:
-                    shap_values_raw = None
-                if shap_values_raw is not None:
-                    shap_values_2d, shap_meta = _normalize_shap_values(shap_values_raw, n_samples=X_sample.shape[0])
-                    if shap_values_2d is not None:
-                        expl = ClassifierExplainer(fitted_clf, X_sample, y_sample, labels=class_names if class_names else None, model_output="probability", shap_values=shap_values_2d)
-                    else:
-                        raise
-                else:
-                    raise
-            else:
-                raise
-        except Exception as e:
-            # bubble original assertion if we cannot fix
-            raise ae from e
+        # often raised if explainer tries to compute shap immediately and fails.
+        # We'll try to proceed — sometimes the constructor still leaves an expl object; otherwise re-raise.
+        if expl is None:
+            raise
     except Exception:
-        # any other constructor failure -> re-raise for outer handler
+        # bubble up
         raise
 
-    # Create the dashboard object with a conservative config
+    # 2) if expl has shap_values attribute and it is 3D, normalize and set back in place
+    try:
+        sv = None
+        if hasattr(expl, "shap_values"):
+            sv = getattr(expl, "shap_values", None)
+        # sometimes shap values are accessible through a method or property - attempt common alternatives
+        if sv is None:
+            for alt in ("raw_shap_values", "_shap_values", "shap_values_"):
+                if hasattr(expl, alt):
+                    sv = getattr(expl, alt)
+                    if sv is not None:
+                        break
+
+        if sv is not None:
+            # Attempt to normalize to 2D if necessary
+            try:
+                shap_2d, meta = _normalize_shap_values_to_2d(sv, n_samples=X_sample.shape[0])
+                if shap_2d is not None:
+                    ok = _set_explainer_shap_values_inplace(expl, shap_2d)
+                    # If not ok, attempt to set via fallback: create attribute directly
+                    if not ok:
+                        try:
+                            expl.shap_values = shap_2d
+                        except Exception:
+                            try:
+                                setattr(expl, "_shap_values", shap_2d)
+                            except Exception:
+                                pass
+            except Exception:
+                # swallow - dashboard constructor will attempt to recompute or error later
+                pass
+        else:
+            # shap not present yet — attempt to compute shap externally and set if possible
+            if SHAP_AVAILABLE:
+                try:
+                    # try shap.Explainer then TreeExplainer fallback
+                    try:
+                        shap_expl = shap.Explainer(fitted_clf, X_sample)
+                        shap_vals_obj = shap_expl(X_sample)
+                        shap_values_raw = getattr(shap_vals_obj, "values", None)
+                    except Exception:
+                        shap_values_raw = None
+                    if shap_values_raw is None:
+                        try:
+                            shap_values_raw = shap.TreeExplainer(fitted_clf).shap_values(X_sample)
+                        except Exception:
+                            shap_values_raw = None
+
+                    if shap_values_raw is not None:
+                        shap_2d, meta = _normalize_shap_values_to_2d(shap_values_raw, n_samples=X_sample.shape[0])
+                        if shap_2d is not None:
+                            _set_explainer_shap_values_inplace(expl, shap_2d)
+                except Exception:
+                    pass
+    except Exception:
+        # continue; we'll catch downstream errors when building dashboard / exporting
+        pass
+
+    # 3) Build dashboard object
     try:
         dashboard = ExplainerDashboard(
             expl,
@@ -435,60 +459,39 @@ def generate_explainer_dashboard_html_file(fitted_clf, X_sample: pd.DataFrame, y
             fluid=True,
         )
     except Exception:
-        # If constructing dashboard still fails (perhaps due to internal shap shape checks),
-        # try to repair expl by forcing expl.shap_values to the 2D version if we have it.
-        try:
-            if SHAP_AVAILABLE and shap_values_2d is not None:
-                # set attribute if available (best-effort)
-                try:
-                    expl.shap_values = shap_values_2d
-                except Exception:
-                    pass
-                # reattempt dashboard creation
-                dashboard = ExplainerDashboard(
-                    expl,
-                    title="Model Performance Dashboard",
-                    bootstrap="FLATLY",
-                    whatif=True,
-                    importances=True,
-                    model_summary=True,
-                    contributions=True,
-                    shap_dependence=True,
-                    shap_interaction=True,
-                    decision_trees=isinstance(fitted_clf, DecisionTreeClassifier),
-                    hide_poweredby=True,
-                    fluid=True,
-                )
-            else:
-                raise
-        except Exception as e:
-            # give up and propagate the last error for caller to handle
-            raise
+        # If this fails even after shap normalization, re-raise for caller to handle
+        raise
 
-    # Export the dashboard to HTML. Different explainerdashboard versions differ in method names/args.
+    # 4) Export dashboard to HTML (try multiple methods)
     try:
-        # Prefer to_html(path) signature
+        # Prefer to_html(path)
         try:
             dashboard.to_html(fd_path)
             return fd_path
         except TypeError:
-            # fallback: older signature may accept no args or use to_file
-            # try to_file first
+            # method exists but signature mismatch
+            pass
+        except Exception:
+            # maybe to_html doesn't take args; try to_file next
+            pass
+
+        try:
+            # try to_file (older versions)
+            dashboard.to_file(fd_path)
+            return fd_path
+        except Exception:
+            # try to_html() returning string
             try:
-                dashboard.to_file(fd_path)
-                return fd_path
-            except Exception:
-                # final fallback: try to_html() returning string
                 html_str = dashboard.to_html()
                 if isinstance(html_str, str) and html_str.strip():
                     with open(fd_path, "w", encoding="utf-8") as fh:
                         fh.write(html_str)
                     return fd_path
                 else:
-                    # if nothing worked, raise
-                    raise RuntimeError("Unable to export dashboard to HTML with available methods.")
+                    raise RuntimeError("dashboard.to_html() returned empty or non-string.")
+            except Exception as e:
+                raise RuntimeError(f"Unable to export dashboard to HTML: {e}")
     except Exception:
-        # bubble up to caller
         raise
 
 def safe_onehot_encoder():
@@ -575,7 +578,6 @@ with tab1:
                 with st.spinner("Generating profile HTML (this may take time on large datasets)..."):
                     try:
                         tmp_dir = None
-                        # create temp file and get path
                         profile_html_path = generate_profile_html_file(df, tmp_dir=tmp_dir)
                         st.session_state.profile_html_path = profile_html_path
                         st.session_state.profile_generated = True
@@ -740,7 +742,6 @@ with tab3:
         X_test_df = st.session_state.trained_X_test.copy()
         y_test_arr = st.session_state.trained_y_test
 
-        # Performance summary
         st.subheader("📊 Performance Summary")
         p1, p2, p3 = st.columns(3)
         with p1:
@@ -763,7 +764,6 @@ with tab3:
             except Exception:
                 st.info("Classification report not available.")
 
-        # auto-select index
         if st.session_state.explainer_selected_index is None:
             if len(X_test_df) > 0:
                 st.session_state.explainer_selected_index = int(random.randrange(0, len(X_test_df)))
@@ -817,50 +817,39 @@ with tab3:
 
             st.markdown("---")
 
-            # Build and embed ExplainerDashboard HTML file when possible
             if EXPLAINERDASH_AVAILABLE:
                 st.markdown("### ExplainerDashboard (HTML-embedded)")
                 st.markdown("The app will export a standalone dashboard HTML and embed it here. This avoids many Streamlit/Plotly rendering mismatches.")
                 try:
-                    # sample for dashboard (limit size)
                     sample_n = min(1000, len(X_test_df))
                     sample_idx = np.random.choice(len(X_test_df), size=sample_n, replace=False)
                     X_dash = X_test_df.iloc[sample_idx]
                     y_dash = y_test_arr[sample_idx]
 
-                    # attempt to extract the classifier (not pipeline) if present
                     try:
                         fitted_clf = clf_pipeline.named_steps.get("classifier", clf_pipeline)
                     except Exception:
                         fitted_clf = clf_pipeline
 
-                    # Attempt to generate dashboard HTML file
                     try:
                         dashboard_html_path = generate_explainer_dashboard_html_file(fitted_clf, X_dash, y_dash, class_names=class_names)
-                        # Read and optionally patch HTML if needed (titlefont -> title_font)
                         with open(dashboard_html_path, "r", encoding="utf-8") as fh:
                             dashboard_html = fh.read()
-                        # best-effort patch for property name mismatches (titlefont -> title_font)
                         dashboard_html = dashboard_html.replace("titlefont", "title_font")
                         st.success("✅ ExplainerDashboard HTML generated and embedded below.")
                         components.html(dashboard_html, height=900, scrolling=True)
-                        # store path in session so user can download or inspect if needed
                         st.session_state.dashboard_html_path = dashboard_html_path
                     except Exception as dashboard_err:
-                        # Dashboard failed during generation or export. Provide informative message & fallback visuals.
                         st.error(f"ExplainerDashboard construction/export failed: {dashboard_err}")
-                        st.info("Displaying fallback diagnostics below that replicate dashboard insights (note: SHAP visuals are not recreated here).")
+                        st.info("Displaying fallback diagnostics (no SHAP visuals).")
                         st.text(traceback.format_exc())
-                        # FALLBACK: show diagnostics (no SHAP visuals)
-                        # Confusion matrix
+                        # FALLBACK diagnostics...
                         try:
                             cm = confusion_matrix(y_test_arr, test_results["y_pred"])
                             st.markdown("**Confusion Matrix**")
-                            cm_df = pd.DataFrame(cm)
-                            st.dataframe(cm_df)
+                            st.dataframe(pd.DataFrame(cm))
                         except Exception:
                             st.info("Confusion matrix not available.")
-                        # ROC (binary) and PR
                         try:
                             if hasattr(clf_pipeline, "predict_proba"):
                                 proba = clf_pipeline.predict_proba(X_test_df)
@@ -890,17 +879,11 @@ with tab3:
                                 st.info("No predict_proba available for ROC/PR.")
                         except Exception:
                             st.info("ROC/PR generation failed.")
-                        # Feature importances (if available)
                         try:
-                            # extract classifier
-                            try:
-                                clf = clf_pipeline.named_steps.get("classifier", None)
-                            except Exception:
-                                clf = clf_pipeline
+                            clf = clf_pipeline.named_steps.get("classifier", clf_pipeline)
                             if hasattr(clf, "feature_importances_"):
                                 st.markdown("**Feature importances (top 20)**")
                                 fi = np.array(clf.feature_importances_)
-                                # try to fetch feature names from preprocessor
                                 try:
                                     pre = clf_pipeline.named_steps.get("preprocessor", None)
                                     if pre is not None and hasattr(pre, "get_feature_names_out"):
@@ -922,15 +905,13 @@ with tab3:
                     st.error(f"Unexpected error while preparing/executing the dashboard: {e}")
                     st.text(traceback.format_exc())
             else:
-                # ExplainerDashboard not installed
                 st.markdown("ExplainerDashboard not installed in this environment. Install `explainerdashboard` to enable a full interactive embedded dashboard.")
                 st.info("Showing fallback diagnostics (no SHAP visuals).")
                 # fallback diagnostics (same as above)
                 try:
                     cm = confusion_matrix(y_test_arr, test_results["y_pred"])
                     st.markdown("**Confusion Matrix**")
-                    cm_df = pd.DataFrame(cm)
-                    st.dataframe(cm_df)
+                    st.dataframe(pd.DataFrame(cm))
                 except Exception:
                     st.info("Confusion matrix not available.")
                 try:
@@ -961,10 +942,9 @@ with tab3:
                     else:
                         st.info("No predict_proba available for ROC/PR.")
                 except Exception:
-                    st.info("ROC/PR generation failed. ")
+                    st.info("ROC/PR generation failed.")
 
             st.markdown("---")
-            # Partial Dependence Plot (approx) — keep as a small, helpful diagnostic
             st.markdown("### Partial Dependence Plot (approx)")
             try:
                 numeric_cols = X_test_df.select_dtypes(include=np.number).columns.tolist()
