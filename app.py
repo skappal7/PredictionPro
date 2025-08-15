@@ -1,19 +1,22 @@
 # app.py
 """
-Predictive Analytics Streamlit App — Full Version (fixed)
-- Robust profiling with sanitization + fallback HTML if ProfileReport.to_html fails
-- ExplainerDashboard attempted; if it fails (Plotly titlefont error), show internal fallback explainer visuals
-- Compact SHAP visuals and safe pipeline handling
-- Defensive programming and user guidance
+Predictive Analytics Streamlit App — HTML-embedded profiling & dashboard
+- Profiling and ExplainerDashboard are exported to standalone HTML files, then embedded via components.html()
+- Separate SHAP visuals removed — ExplainerDashboard provides SHAP & contributions when available
+- If ExplainerDashboard cannot be built (e.g., Plotly property mismatch), fallback metrics/charts are displayed (no SHAP visuals)
+- Defensive sanitization for profiling to avoid profiler crashes
+- Safe filename handling, fixed f-strings, and clear guidance messages
 """
 
 import io
+import os
 import re
 import html
 import tempfile
 import traceback
 import random
 from pathlib import Path
+from typing import Optional
 
 import matplotlib
 matplotlib.use("Agg")
@@ -35,9 +38,9 @@ import pandas as pd
 import numpy as np
 
 # -------------------------
-# Optional libs (safeguarded)
+# Optional third-party libraries (guarded imports)
 # -------------------------
-# Profiling
+# Profiling libs
 try:
     from ydata_profiling import ProfileReport
     PROFILING_LIB = "ydata_profiling"
@@ -56,7 +59,7 @@ try:
 except Exception:
     HAS_ST_PROFILE = False
 
-# ML libraries
+# ML stack
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder, OneHotEncoder, StandardScaler
 from sklearn.compose import ColumnTransformer
@@ -78,7 +81,7 @@ except Exception:
     SMOTE = RandomOverSampler = RandomUnderSampler = None
     IMB_AVAILABLE = False
 
-# SHAP
+# SHAP (not used separately any more; dashboard provides SHAP)
 try:
     import shap
     SHAP_AVAILABLE = True
@@ -97,32 +100,37 @@ except Exception:
 # Page config and session defaults
 # -------------------------
 st.set_page_config(page_title="Predictive Analytics App", layout="wide", page_icon="📊")
-st.title("📊 Predictive Analytics — Explorer & Explainer")
-st.markdown("Upload dataset → profile → train → explain → predict.")
+st.title("📊 Predictive Analytics — Profiling & Explainer (HTML-embedded)")
+st.markdown("Upload dataset → Generate profile → Train model → View ExplainerDashboard (embedded) → Predict")
 
-# session defaults
-_default_keys = {
+_session_defaults = {
     "data_uploaded": False,
     "profile_generated": False,
     "model_trained": False,
     "current_file": None,
     "data": None,
-    "profile_html": None,
+    "profile_html_path": None,
+    "dashboard_html_path": None,
     "explainer_selected_index": None,
 }
-for k, v in _default_keys.items():
+for k, v in _session_defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
 # -------------------------
 # Helper functions
 # -------------------------
+def safe_filename_base(name: str) -> str:
+    """Return a safe filename stem (no extension)."""
+    base = Path(name).stem
+    return re.sub(r"[^A-Za-z0-9_\-]", "_", base)[:128]
+
 def class_counts(y_arr):
     vc = pd.Series(y_arr).value_counts().sort_index()
     return {str(k): int(v) for k, v in vc.items()}
 
 def load_data_safe(uploaded_file):
-    """Load CSV or Excel safely, with fallback attempts."""
+    """Load CSV or Excel safely with fallbacks."""
     try:
         name = uploaded_file.name.lower()
         if name.endswith(".csv"):
@@ -140,137 +148,181 @@ def load_data_safe(uploaded_file):
 def is_scalar_value(v):
     return not isinstance(v, (list, dict, set, tuple, np.ndarray, pd.Series))
 
-def sanitize_dataframe_for_profiling(df: pd.DataFrame, check_n=50):
+def sanitize_dataframe_for_profiling(df: pd.DataFrame, check_n: int = 50) -> pd.DataFrame:
     """
-    Sanitize DataFrame before profiling:
-      - Ensure DataFrame type
-      - Drop fully-empty columns
-      - Attempt to coerce object columns that are numeric-like
-      - Drop columns that contain nested or non-scalar values (lists/dicts/arrays)
-      - Drop constant columns (nunique <= 1)
-      - Reset index
+    Sanitize DataFrame for ydata/pandas profiling:
+    - Convert to DataFrame
+    - Drop completely empty columns
+    - Coerce object-like numeric strings
+    - Drop columns with nested/complex values (lists, dicts, arrays)
+    - Drop constant columns (nunique <= 1)
+    - Reset index
     """
     if df is None:
         return pd.DataFrame()
     if not isinstance(df, pd.DataFrame):
         df = pd.DataFrame(df)
+    # Drop fully empty columns
     df = df.dropna(axis=1, how="all")
-    # coerce object cols that look numeric
+    # Coerce object columns that look numeric
     for col in df.columns:
-        if df[col].dtype == "object":
-            nonnull = df[col].dropna().head(check_n)
+        if df[col].dtype == object:
+            nonnull_sample = df[col].dropna().head(check_n)
             try:
-                coerced = pd.to_numeric(nonnull)
-                if len(coerced) >= len(nonnull) * 0.9:
+                coerced = pd.to_numeric(nonnull_sample)
+                if len(coerced) >= max(1, int(len(nonnull_sample) * 0.9)):
                     df[col] = pd.to_numeric(df[col], errors="coerce")
             except Exception:
                 pass
-    # drop nested-type columns
+    # Drop nested columns
     drop_cols = []
     for col in df.columns:
-        sample = df[col].dropna().head(check_n).tolist()
-        for v in sample:
+        sample_vals = df[col].dropna().head(check_n).tolist()
+        for v in sample_vals:
             if not is_scalar_value(v):
                 drop_cols.append(col)
                 break
     if drop_cols:
         df = df.drop(columns=list(set(drop_cols)))
-    # drop constant columns
+    # Drop constant columns
     nunique = df.nunique(dropna=False)
-    keep = nunique[nunique > 1].index.tolist()
-    df = df.loc[:, keep]
+    keep_cols = nunique[nunique > 1].index.tolist()
+    df = df.loc[:, keep_cols]
     df = df.reset_index(drop=True)
     return df
 
-def generate_profile_report_safe(df: pd.DataFrame):
+def generate_profile_html_file(df: pd.DataFrame, tmp_dir: Optional[str] = None) -> str:
     """
-    Generate profiling HTML:
-      - Try ProfileReport.to_html(); if that fails, provide fallback HTML containing
-        basic pandas summaries so profiling never raises an exception for the app.
+    Generate a profiling HTML file and return file path.
+    - Use ProfileReport.to_file if available (safer)
+    - If ProfileReport absent, return an HTML string written to file containing fallback info.
     """
     if ProfileReport is None:
-        return "<h3>Profiling library not available</h3><p>Install 'ydata-profiling' or 'pandas-profiling' to enable full reports.</p>"
+        # generate fallback HTML summary and write to temp file
+        out_html = "<h3>Profiling library not installed</h3><p>Install 'ydata-profiling' or 'pandas-profiling' to get full reports.</p>"
+        fd = tempfile.NamedTemporaryFile(delete=False, suffix=".html", dir=tmp_dir)
+        fd.write(out_html.encode("utf-8"))
+        fd.close()
+        return fd.name
+
+    # sanitize
+    df_s = sanitize_dataframe_for_profiling(df)
+    if df_s.shape[1] == 0:
+        out_html = "<h3>No columns available to profile after sanitization.</h3>"
+        fd = tempfile.NamedTemporaryFile(delete=False, suffix=".html", dir=tmp_dir)
+        fd.write(out_html.encode("utf-8"))
+        fd.close()
+        return fd.name
+
+    profile = ProfileReport(df_s, title="Dataset Profiling Report", explorative=True)
+    # prefer to_file when available
     try:
-        df_s = sanitize_dataframe_for_profiling(df)
-        if df_s.shape[1] == 0:
-            return "<h3>No columns available to profile after sanitization.</h3>"
-        profile = ProfileReport(df_s, title="Dataset Profiling Report", explorative=True)
+        # write to temp file
+        fd = tempfile.NamedTemporaryFile(delete=False, suffix=".html", dir=tmp_dir)
+        fd_path = fd.name
+        fd.close()
         try:
-            return profile.to_html()
+            profile.to_file(fd_path)
+            return fd_path
         except Exception:
-            # fallback: build HTML from pandas summaries
-            try:
-                html_parts = []
-                html_parts.append("<h2>Fallback Profiling Report</h2>")
-                html_parts.append("<p><em>ProfileReport.to_html() failed — presenting a pandas-based fallback summary.</em></p>")
-                html_parts.append("<h3>Sample (first 10 rows)</h3>")
-                html_parts.append(df_s.head(10).to_html(classes='table table-striped', index=False))
-                html_parts.append("<h3>Column dtypes</h3>")
-                html_parts.append(df_s.dtypes.to_frame("dtype").to_html(classes='table table-striped'))
-                html_parts.append("<h3>Null counts</h3>")
-                nulls = df_s.isnull().sum()
-                html_parts.append(nulls.to_frame("null_count").to_html(classes='table table-striped'))
-                html_parts.append("<h3>Unique counts (top 10)</h3>")
-                uniq = df_s.nunique().sort_values()
-                html_parts.append(uniq.to_frame("unique_count").to_html(classes='table table-striped'))
-                html_parts.append("<h3>Descriptive statistics (numeric)</h3>")
-                html_parts.append(df_s.describe().T.to_html(classes='table table-striped'))
-                try:
-                    corr = df_s.corr()
-                    html_parts.append("<h3>Correlation (pearson) — numeric cols</h3>")
-                    html_parts.append(corr.to_html(classes='table table-striped'))
-                except Exception:
-                    pass
-                return "<html><body style='font-family:Arial, Helvetica, sans-serif; padding:10px'>" + "".join(html_parts) + "</body></html>"
-            except Exception:
-                tb = traceback.format_exc()
-                return f"<h3>Profiling fallback generation failed</h3><pre>{html.escape(tb)}</pre>"
+            # some versions may not support to_file; fallback to to_html string and write
+            html_str = profile.to_html()
+            with open(fd_path, "w", encoding="utf-8") as fh:
+                fh.write(html_str)
+            return fd_path
     except Exception:
-        tb = traceback.format_exc()
-        return f"<h3>Profiling sanitization failed</h3><pre>{html.escape(tb)}</pre>"
+        # fallback: build minimal HTML summary and write to tmp file
+        try:
+            parts = []
+            parts.append("<h2>Fallback Profiling Report</h2>")
+            parts.append("<p>Profiler failed to export — presenting pandas summaries below.</p>")
+            parts.append("<h3>Sample (first 10 rows)</h3>")
+            parts.append(df_s.head(10).to_html(classes='table table-striped', index=False))
+            parts.append("<h3>Column dtypes</h3>")
+            parts.append(df_s.dtypes.to_frame("dtype").to_html(classes='table table-striped'))
+            parts.append("<h3>Null counts</h3>")
+            parts.append(df_s.isnull().sum().to_frame("null_count").to_html(classes='table table-striped'))
+            parts.append("<h3>Unique counts</h3>")
+            parts.append(df_s.nunique().to_frame("unique_count").to_html(classes='table table-striped'))
+            parts.append("<h3>Descriptive stats (numeric)</h3>")
+            try:
+                parts.append(df_s.describe().T.to_html(classes='table table-striped'))
+            except Exception:
+                pass
+            fallback_html = "<html><body style='font-family:Arial, Helvetica, sans-serif;padding:10px'>" + "".join(parts) + "</body></html>"
+            fd = tempfile.NamedTemporaryFile(delete=False, suffix=".html", dir=tmp_dir)
+            with open(fd.name, "w", encoding="utf-8") as fh:
+                fh.write(fallback_html)
+            return fd.name
+        except Exception:
+            # final fallback: very small message
+            fd = tempfile.NamedTemporaryFile(delete=False, suffix=".html", dir=tmp_dir)
+            with open(fd.name, "w", encoding="utf-8") as fh:
+                fh.write("<h3>Profiling generation failed and fallback generation also failed.</h3>")
+            return fd.name
+
+def generate_explainer_dashboard_html_file(fitted_clf, X_sample: pd.DataFrame, y_sample: np.ndarray, class_names: Optional[list] = None, tmp_dir: Optional[str] = None) -> str:
+    """
+    Attempt to build an ExplainerDashboard and write to an HTML file. Return file path.
+    If ExplainerDashboard is not available, raise Exception.
+    """
+    if not EXPLAINERDASH_AVAILABLE:
+        raise RuntimeError("explainerdashboard not installed in environment.")
+    expl = ClassifierExplainer(fitted_clf, X_sample, y_sample, labels=class_names if class_names else None, model_output="probability")
+    dashboard = ExplainerDashboard(
+        expl,
+        title="Model Performance Dashboard",
+        bootstrap="FLATLY",
+        whatif=True,
+        importances=True,
+        model_summary=True,
+        contributions=True,
+        shap_dependence=True,
+        shap_interaction=True,
+        decision_trees=isinstance(fitted_clf, DecisionTreeClassifier),
+        hide_poweredby=True,
+        fluid=True,
+    )
+    fd = tempfile.NamedTemporaryFile(delete=False, suffix=".html", dir=tmp_dir)
+    fd_path = fd.name
+    fd.close()
+    # to_file preferred; catch exceptions from construction/export
+    try:
+        dashboard.to_file(fd_path)
+        return fd_path
+    except Exception:
+        # older versions sometimes need to_html or to_html(filename=...)
+        try:
+            dashboard.to_html(filename=fd_path)
+            return fd_path
+        except Exception as e:
+            # bubble up exception for caller fallback handling
+            raise
+
+def patch_html_titlefont_workaround(html_str: str) -> str:
+    """
+    Best-effort PATCH to replace common Plotly layout property names that older/newer Plotly versions disagree on,
+    e.g., titlefont -> title_font. This operates on the generated HTML string.
+    Note: If error originates during dashboard construction (not after HTML creation), this will not help.
+    """
+    if not isinstance(html_str, str):
+        return html_str
+    s = html_str
+    # JSON-style "titlefont": { -> "title_font": {
+    s = re.sub(r'("titlefont"\s*:\s*)\{', r'"title_font": {', s)
+    # JS-style .titlefont = { -> .title_font = {
+    s = re.sub(r'(\.titlefont\s*=\s*)\{', r'.title_font = {', s)
+    # property references
+    s = re.sub(r'\.titlefont\b', r'.title_font', s)
+    # key without quotes: titlefont: { -> title_font: {
+    s = re.sub(r'(\btitlefont\s*:\s*)\{', r'title_font: {', s)
+    return s
 
 def safe_onehot_encoder():
     try:
         return OneHotEncoder(handle_unknown="ignore", sparse_output=False)
     except TypeError:
         return OneHotEncoder(handle_unknown="ignore", sparse=False)
-
-def safe_shap_explainer(fitted_model, background_data, feature_names=None):
-    if not SHAP_AVAILABLE:
-        return None
-    try:
-        if feature_names is not None:
-            return shap.Explainer(fitted_model, background_data, feature_names=feature_names)
-        return shap.Explainer(fitted_model, background_data)
-    except Exception:
-        try:
-            return shap.Explainer(fitted_model, background_data)
-        except Exception:
-            return None
-
-def ensure_shap_array_for_idx(vals_obj, idx):
-    try:
-        if hasattr(vals_obj, "values"):
-            vals = vals_obj.values
-        else:
-            vals = vals_obj
-        arr = np.array(vals)
-        if arr.ndim == 1:
-            return arr.ravel()
-        if arr.ndim == 2:
-            return arr[idx].ravel()
-        if arr.ndim == 3:
-            # attempt sample-first
-            if arr.shape[0] == len(vals):
-                return arr[idx].ravel()
-            # fallback: choose class with largest mean abs
-            s = arr[idx]
-            if s.ndim == 2:
-                out_idx = int(np.argmax(np.abs(s).mean(axis=1)))
-                return s[out_idx].ravel()
-            return s.ravel()
-    except Exception:
-        return None
 
 def make_pdp_values(clf_pipeline, base_row_df, feature, grid):
     preds = []
@@ -288,176 +340,8 @@ def make_pdp_values(clf_pipeline, base_row_df, feature, grid):
             preds.append(np.nan)
     return preds
 
-def compact_shap_summary_plot(shap_values, X):
-    plt.close("all")
-    fig = plt.figure(figsize=(5, 3))
-    try:
-        shap.summary_plot(shap_values, X, show=False)
-        plt.tight_layout()
-        return fig
-    except Exception:
-        arr = np.abs(np.array(shap_values))
-        if arr.ndim == 3:
-            mean_imp = np.mean(np.mean(arr, axis=1), axis=0)
-        else:
-            mean_imp = np.mean(arr, axis=0)
-        idxs = np.argsort(mean_imp)[-20:]
-        feats = X.columns.tolist()
-        sel = [feats[i] for i in idxs]
-        vals = mean_imp[idxs]
-        ax = fig.add_subplot(111)
-        ax.barh(sel, vals)
-        ax.set_xlabel("mean(|SHAP value|)")
-        plt.tight_layout()
-        return fig
-
-def safe_filename_from_upload(name: str):
-    base = Path(name).stem
-    return re.sub(r"[^A-Za-z0-9_\-]", "_", base)
-
-def fallback_explainer_visuals(clf_pipeline, X_test_df, y_test_arr, le_target, class_names, idx):
-    """
-    If ExplainerDashboard cannot be constructed, show a set of fallback visuals:
-    - Confusion matrix
-    - ROC curve (if binary or probability available)
-    - Precision-recall curve
-    - Feature importances (if available)
-    - SHAP summary + local contributions (if SHAP available)
-    """
-    st.subheader("Fallback Explainer Visuals")
-    st.markdown("ExplainerDashboard failed to initialize in your environment; showing equivalent analysis here.")
-    y_true = np.array(y_test_arr)
-    y_pred = clf_pipeline.predict(X_test_df)
-    try:
-        # Confusion matrix
-        cm = confusion_matrix(y_true, y_pred)
-        st.markdown("**Confusion Matrix**")
-        cm_df = pd.DataFrame(cm)
-        st.dataframe(cm_df)
-    except Exception:
-        st.info("Confusion matrix not available.")
-
-    # ROC / AUC (if probability and binary)
-    try:
-        if hasattr(clf_pipeline, "predict_proba"):
-            proba = clf_pipeline.predict_proba(X_test_df)
-            if proba.shape[1] == 2:
-                fpr, tpr, _ = roc_curve(y_true, proba[:, 1])
-                roc_auc = auc(fpr, tpr)
-                fig, ax = plt.subplots(figsize=(5, 3))
-                ax.plot(fpr, tpr, label=f"AUC={roc_auc:.3f}")
-                ax.plot([0, 1], [0, 1], "--", linewidth=0.7)
-                ax.set_xlabel("False Positive Rate")
-                ax.set_ylabel("True Positive Rate")
-                ax.set_title("ROC curve")
-                ax.legend()
-                plt.tight_layout()
-                st.pyplot(fig)
-            else:
-                st.info("ROC curve requires binary problem or probability for positive class.")
-        else:
-            st.info("No predict_proba available for ROC curve.")
-    except Exception:
-        st.info("ROC curve generation failed.")
-
-    # Precision-Recall
-    try:
-        if hasattr(clf_pipeline, "predict_proba"):
-            proba = clf_pipeline.predict_proba(X_test_df)
-            if proba.shape[1] == 2:
-                precision, recall, _ = precision_recall_curve(y_true, proba[:, 1])
-                fig, ax = plt.subplots(figsize=(5, 3))
-                ax.plot(recall, precision)
-                ax.set_xlabel("Recall")
-                ax.set_ylabel("Precision")
-                ax.set_title("Precision-Recall")
-                plt.tight_layout()
-                st.pyplot(fig)
-    except Exception:
-        st.info("Precision-Recall generation failed.")
-
-    # Feature importances (tree-based)
-    try:
-        # attempt to get classifier from pipeline
-        if isinstance(clf_pipeline, Pipeline) or hasattr(clf_pipeline, "named_steps"):
-            try:
-                clf = clf_pipeline.named_steps.get("classifier", None) or clf_pipeline.steps[-1][1]
-            except Exception:
-                clf = clf_pipeline
-        else:
-            clf = clf_pipeline
-        if hasattr(clf, "feature_importances_"):
-            st.markdown("**Feature importances**")
-            fi = np.array(clf.feature_importances_)
-            # try to get feature names
-            try:
-                pre = clf_pipeline.named_steps.get("preprocessor", None)
-                if pre is not None and hasattr(pre, "get_feature_names_out"):
-                    feat_names = pre.get_feature_names_out()
-                else:
-                    feat_names = X_test_df.columns.tolist()
-            except Exception:
-                feat_names = X_test_df.columns.tolist()
-            fi_df = pd.DataFrame({"feature": feat_names, "importance": fi})
-            fi_df = fi_df.sort_values("importance", ascending=False).head(20)
-            st.dataframe(fi_df, use_container_width=True)
-            fig, ax = plt.subplots(figsize=(5, 3))
-            ax.barh(fi_df["feature"][::-1], fi_df["importance"][::-1])
-            plt.tight_layout()
-            st.pyplot(fig)
-    except Exception:
-        pass
-
-    # SHAP visuals (if SHAP available)
-    if SHAP_AVAILABLE:
-        try:
-            pre = None
-            try:
-                pre = clf_pipeline.named_steps.get("preprocessor", None)
-            except Exception:
-                pre = None
-            # background
-            try:
-                bg = pre.transform(X_test_df) if pre is not None else X_test_df.values
-            except Exception:
-                bg = X_test_df.values
-            expl = safe_shap_explainer(clf_pipeline.named_steps.get("classifier", clf_pipeline) if hasattr(clf_pipeline, "named_steps") else clf_pipeline, bg, feature_names=(pre.get_feature_names_out() if pre is not None and hasattr(pre, "get_feature_names_out") else X_test_df.columns.tolist()))
-            if expl is not None:
-                st.markdown("**SHAP global summary (compact)**")
-                X_for_shap = X_test_df.head(200)
-                try:
-                    shap_vals = expl(X_for_shap)
-                    shap_vals_to_plot = shap_vals.values if hasattr(shap_vals, "values") else shap_vals
-                    fig = compact_shap_summary_plot(shap_vals_to_plot, X_for_shap)
-                    st.pyplot(fig)
-                except Exception:
-                    st.info("SHAP global summary failed.")
-                st.markdown("**SHAP local contributions (for selected index)**")
-                try:
-                    single = X_test_df.iloc[[idx]]
-                    single_proc = pre.transform(single) if pre is not None else single.values
-                    shap_out = expl(single_proc)
-                    local_vals = shap_out.values if hasattr(shap_out, "values") else shap_out
-                    local_arr = ensure_shap_array_for_idx(local_vals, 0)
-                    if local_arr is not None:
-                        feat_names = pre.get_feature_names_out() if pre is not None and hasattr(pre, "get_feature_names_out") else X_test_df.columns.tolist()
-                        contrib_df = pd.DataFrame({"feature": list(feat_names), "contribution": local_arr})
-                        contrib_df["abs_contrib"] = contrib_df["contribution"].abs()
-                        contrib_df = contrib_df.sort_values("abs_contrib", ascending=False).head(20)
-                        st.dataframe(contrib_df[["feature", "contribution"]], use_container_width=True)
-                        fig, ax = plt.subplots(figsize=(5, 3))
-                        ax.barh(contrib_df["feature"][::-1], contrib_df["contribution"][::-1])
-                        plt.tight_layout()
-                        st.pyplot(fig)
-                except Exception:
-                    st.info("SHAP local contributions failed.")
-        except Exception:
-            st.info("SHAP visuals generation failed or SHAP not supported for this model.")
-    else:
-        st.info("SHAP not installed; install 'shap' to see SHAP-based visuals.")
-
 # -------------------------
-# Sidebar: upload
+# Sidebar — upload
 # -------------------------
 with st.sidebar:
     st.header("📁 Data Upload")
@@ -488,13 +372,13 @@ else:
 tab1, tab2, tab3, tab4 = st.tabs(["📊 Data Profiling", "🚀 Model Development", "🔍 Model Evaluation & Explainer", "📈 Predictions"])
 
 # -------------------------
-# TAB 1: Data Profiling
+# TAB 1: DATA PROFILING (HTML-embedded)
 # -------------------------
 with tab1:
-    st.header("📊 Data Profiling")
-    st.markdown("Generate a profiling report. The app sanitizes the dataset to remove problematic columns.")
+    st.header("📊 Data Profiling (HTML-embedded)")
+    st.markdown("Generate a profiling report. The report is exported as a standalone HTML file and embedded into this app for reliable rendering.")
     if not st.session_state.data_uploaded:
-        st.info("👈 Please upload a dataset in the sidebar to begin profiling.")
+        st.info("👈 Upload a dataset in the sidebar to begin profiling.")
     else:
         df = st.session_state.data
         c1, c2, c3, c4 = st.columns(4)
@@ -507,41 +391,44 @@ with tab1:
             st.metric("Memory", f"{mem_mb:.1f} MB")
         with c4:
             st.metric("Missing values", int(df.isnull().sum().sum()))
-        with st.expander("Quick preview"):
-            st.dataframe(df.head())
 
-        if st.button("🔍 Generate Comprehensive Profile Report"):
+        with st.expander("Quick Preview"):
+            st.dataframe(df.head(5))
+
+        if st.button("🔍 Generate & Embed Profile Report (HTML)"):
             if ProfileReport is None:
-                st.error("Profiling library not installed. Add 'ydata-profiling' or 'pandas-profiling' to requirements.")
+                st.error("Profiling library not installed. Add 'ydata-profiling' or 'pandas-profiling' to your environment.")
             else:
-                with st.spinner("Generating profiling report..."):
+                with st.spinner("Generating profile HTML (this may take time on large datasets)..."):
                     try:
-                        html_out = generate_profile_report_safe(df)
-                        st.session_state.profile_html = html_out
+                        tmp_dir = None
+                        # create temp file and get path
+                        profile_html_path = generate_profile_html_file(df, tmp_dir=tmp_dir)
+                        st.session_state.profile_html_path = profile_html_path
                         st.session_state.profile_generated = True
-                        st.success("✅ Profile generated (sanitized).")
+                        st.success("✅ Profiling HTML generated.")
                     except Exception as e:
                         st.error(f"Profile generation failed: {e}")
                         st.text(traceback.format_exc())
 
-        if st.session_state.profile_generated and st.session_state.profile_html:
-            st.subheader("📋 Profiling Report")
-            if HAS_ST_PROFILE:
-                try:
-                    st_profile_report(st.session_state.profile_html)
-                except Exception:
-                    components.html(st.session_state.profile_html, height=700, scrolling=True)
-            else:
-                components.html(st.session_state.profile_html, height=700, scrolling=True)
+        if st.session_state.profile_generated and st.session_state.profile_html_path:
+            st.subheader("📋 Embedded Profiling Report")
+            try:
+                with open(st.session_state.profile_html_path, "r", encoding="utf-8") as fh:
+                    html_content = fh.read()
+                components.html(html_content, height=800, scrolling=True)
+            except Exception as e:
+                st.error(f"Failed to read/embed profile HTML: {e}")
+                st.text(traceback.format_exc())
 
 # -------------------------
-# TAB 2: Model Development
+# TAB 2: MODEL DEVELOPMENT
 # -------------------------
 with tab2:
     st.header("🚀 Model Development")
-    st.markdown("Choose target, features, algorithm, balance classes and train the model.")
+    st.markdown("Select target, features, algorithm, and train the model. Class balancing supported if imbalanced-learn is installed.")
     if not st.session_state.data_uploaded:
-        st.info("👈 Upload data first.")
+        st.info("👈 Upload data in the sidebar first.")
     else:
         data = st.session_state.data.copy()
         all_cols = list(data.columns)
@@ -662,11 +549,11 @@ with tab2:
                 st.text(traceback.format_exc())
 
 # -------------------------
-# TAB 3: Model Evaluation & Explainer
+# TAB 3: MODEL EVALUATION & EMBEDDED EXPLAINERDASHBOARD
 # -------------------------
 with tab3:
     st.header("🔍 Model Evaluation & Explainer")
-    st.markdown("Model performance, local explanations, PDP, and ExplainerDashboard (if available). The app will fall back to built-in visuals if the dashboard cannot initialize.")
+    st.markdown("If available, ExplainerDashboard will be exported to a standalone HTML and embedded here. If not available or if dashboard construction fails, the app will show fallback diagnostics (no separate SHAP visuals).")
 
     if not st.session_state.data_uploaded:
         st.info("👈 Upload data first.")
@@ -680,6 +567,7 @@ with tab3:
         X_test_df = st.session_state.trained_X_test.copy()
         y_test_arr = st.session_state.trained_y_test
 
+        # Performance summary
         st.subheader("📊 Performance Summary")
         p1, p2, p3 = st.columns(3)
         with p1:
@@ -689,7 +577,7 @@ with tab3:
         with p3:
             st.metric("Features", len(st.session_state.trained_feature_cols))
 
-        st.subheader("📋 Detailed Performance Report")
+        st.subheader("📋 Classification Report")
         try:
             report = classification_report(y_test_arr, test_results["y_pred"], output_dict=True, target_names=class_names)
             report_df = pd.DataFrame(report).transpose().round(3)
@@ -702,7 +590,7 @@ with tab3:
             except Exception:
                 st.info("Classification report not available.")
 
-        # Auto-select index
+        # auto-select index
         if st.session_state.explainer_selected_index is None:
             if len(X_test_df) > 0:
                 st.session_state.explainer_selected_index = int(random.randrange(0, len(X_test_df)))
@@ -712,16 +600,16 @@ with tab3:
         if st.session_state.explainer_selected_index is None:
             st.info("Test set empty — cannot show explainer details.")
         else:
-            idx = st.slider("Select index for explanation", 0, max(0, len(X_test_df) - 1), value=int(st.session_state.explainer_selected_index), step=1)
+            idx = st.slider("Select index for explanation (used by the dashboard)", 0, max(0, len(X_test_df) - 1), value=int(st.session_state.explainer_selected_index), step=1)
             st.session_state.explainer_selected_index = int(idx)
 
             sel_col, pred_col = st.columns([1, 2])
             with sel_col:
                 st.markdown("### Selected index")
                 st.write(f"**{idx}**")
-                st.markdown("**Guidance:** Pick an index to view local explanation & prediction breakdown.")
+                st.markdown("**Guidance:** The embedded ExplainerDashboard's what-if & local explanation controls will reference this index when applicable.")
             with pred_col:
-                st.markdown("### Prediction")
+                st.markdown("### Prediction (selected index)")
                 try:
                     single_row = X_test_df.iloc[[idx]]
                     pred = clf_pipeline.predict(single_row)
@@ -756,65 +644,159 @@ with tab3:
 
             st.markdown("---")
 
-            # Try using ExplainerDashboard, but gracefully fallback if it raises (e.g., Plotly titlefont error)
+            # Build and embed ExplainerDashboard HTML file when possible
             if EXPLAINERDASH_AVAILABLE:
-                st.markdown("### Full ExplainerDashboard (attempting to embed)")
-                st.markdown("If the dashboard cannot initialize due to environment/Plotly incompatibilities, the app will show equivalent fallback visuals below.")
+                st.markdown("### ExplainerDashboard (HTML-embedded)")
+                st.markdown("The app will export a standalone dashboard HTML and embed it here. This avoids many Streamlit/Plotly rendering mismatches.")
                 try:
+                    # sample for dashboard (limit size)
                     sample_n = min(1000, len(X_test_df))
                     sample_idx = np.random.choice(len(X_test_df), size=sample_n, replace=False)
                     X_dash = X_test_df.iloc[sample_idx]
                     y_dash = y_test_arr[sample_idx]
 
-                    fitted_clf = clf_pipeline.named_steps.get("classifier", clf_pipeline)
-
-                    expl = ClassifierExplainer(fitted_clf, X_dash, y_dash, labels=class_names if class_names else None, model_output="probability")
-
-                    dashboard = ExplainerDashboard(
-                        expl,
-                        title="Model Performance Dashboard",
-                        bootstrap="FLATLY",
-                        whatif=True,
-                        importances=True,
-                        model_summary=True,
-                        contributions=True,
-                        shap_dependence=True,
-                        shap_interaction=True,
-                        decision_trees=isinstance(fitted_clf, DecisionTreeClassifier),
-                        hide_poweredby=True,
-                        fluid=True,
-                    )
-
-                    # If it constructs, get HTML
+                    # attempt to extract the classifier (not pipeline) if present
                     try:
-                        html_str = dashboard.to_html()
-                    except TypeError:
-                        with tempfile.TemporaryDirectory() as tmpdir:
-                            html_path = Path(tmpdir) / "dashboard.html"
-                            dashboard.to_html(filename=str(html_path))
-                            html_str = html_path.read_text(encoding="utf-8")
+                        fitted_clf = clf_pipeline.named_steps.get("classifier", clf_pipeline)
+                    except Exception:
+                        fitted_clf = clf_pipeline
 
-                    # small patch for older/newer mismatches (best-effort)
-                    patched = html_str.replace("titlefont", "title_font")
-                    patched = patched.replace("title : {", "title: {")  # no-op harmless
-                    components.html(patched, height=900, scrolling=True)
+                    # Attempt to generate dashboard HTML file
+                    try:
+                        dashboard_html_path = generate_explainer_dashboard_html_file(fitted_clf, X_dash, y_dash, class_names=class_names)
+                        # Read and optionally patch HTML if needed
+                        with open(dashboard_html_path, "r", encoding="utf-8") as fh:
+                            dashboard_html = fh.read()
+                        # best-effort patch for property name mismatches (titlefont -> title_font)
+                        dashboard_html = dashboard_html.replace("titlefont", "title_font")
+                        st.success("✅ ExplainerDashboard HTML generated and embedded below.")
+                        components.html(dashboard_html, height=900, scrolling=True)
+                        # store path in session so user can download or inspect if needed
+                        st.session_state.dashboard_html_path = dashboard_html_path
+                    except Exception as dashboard_err:
+                        # Dashboard failed during generation or export. Provide informative message & fallback visuals.
+                        st.error(f"ExplainerDashboard construction/export failed: {dashboard_err}")
+                        st.info("Displaying fallback diagnostics below that replicate dashboard insights (note: SHAP visuals are not recreated here).")
+                        st.text(traceback.format_exc())
+                        # FALLBACK: show diagnostics (no SHAP visuals)
+                        # Confusion matrix
+                        try:
+                            cm = confusion_matrix(y_test_arr, test_results["y_pred"])
+                            st.markdown("**Confusion Matrix**")
+                            cm_df = pd.DataFrame(cm)
+                            st.dataframe(cm_df)
+                        except Exception:
+                            st.info("Confusion matrix not available.")
+                        # ROC (binary) and PR
+                        try:
+                            if hasattr(clf_pipeline, "predict_proba"):
+                                proba = clf_pipeline.predict_proba(X_test_df)
+                                if proba.shape[1] == 2:
+                                    fpr, tpr, _ = roc_curve(y_test_arr, proba[:, 1])
+                                    roc_auc = auc(fpr, tpr)
+                                    fig, ax = plt.subplots(figsize=(5, 3))
+                                    ax.plot(fpr, tpr, label=f"AUC={roc_auc:.3f}")
+                                    ax.plot([0, 1], [0, 1], "--", linewidth=0.7)
+                                    ax.set_xlabel("False Positive Rate")
+                                    ax.set_ylabel("True Positive Rate")
+                                    ax.set_title("ROC curve")
+                                    ax.legend()
+                                    plt.tight_layout()
+                                    st.pyplot(fig)
+                                    precision, recall, _ = precision_recall_curve(y_test_arr, proba[:, 1])
+                                    fig2, ax2 = plt.subplots(figsize=(5, 3))
+                                    ax2.plot(recall, precision)
+                                    ax2.set_xlabel("Recall")
+                                    ax2.set_ylabel("Precision")
+                                    ax2.set_title("Precision-Recall")
+                                    plt.tight_layout()
+                                    st.pyplot(fig2)
+                                else:
+                                    st.info("ROC/PR: multi-class or no binary probability available.")
+                            else:
+                                st.info("No predict_proba available for ROC/PR.")
+                        except Exception:
+                            st.info("ROC/PR generation failed.")
+                        # Feature importances (if available)
+                        try:
+                            # extract classifier
+                            try:
+                                clf = clf_pipeline.named_steps.get("classifier", None)
+                            except Exception:
+                                clf = clf_pipeline
+                            if hasattr(clf, "feature_importances_"):
+                                st.markdown("**Feature importances (top 20)**")
+                                fi = np.array(clf.feature_importances_)
+                                # try to fetch feature names from preprocessor
+                                try:
+                                    pre = clf_pipeline.named_steps.get("preprocessor", None)
+                                    if pre is not None and hasattr(pre, "get_feature_names_out"):
+                                        feat_names = pre.get_feature_names_out()
+                                    else:
+                                        feat_names = X_test_df.columns.tolist()
+                                except Exception:
+                                    feat_names = X_test_df.columns.tolist()
+                                fi_df = pd.DataFrame({"feature": feat_names, "importance": fi})
+                                fi_df = fi_df.sort_values("importance", ascending=False).head(20)
+                                st.dataframe(fi_df, use_container_width=True)
+                                fig, ax = plt.subplots(figsize=(5, 3))
+                                ax.barh(fi_df["feature"][::-1], fi_df["importance"][::-1])
+                                plt.tight_layout()
+                                st.pyplot(fig)
+                        except Exception:
+                            pass
                 except Exception as e:
-                    st.error(f"ExplainerDashboard failed to build or render: {e}")
-                    st.info("Showing fallback explainer visuals instead.")
-                    # show fallback visuals that replicate dashboard analyses
-                    fallback_explainer_visuals(clf_pipeline, X_test_df, y_test_arr, le_target, class_names, idx)
+                    st.error(f"Unexpected error while preparing/executing the dashboard: {e}")
+                    st.text(traceback.format_exc())
             else:
-                # not available: show fallback visuals
-                st.markdown("ExplainerDashboard not installed — showing fallback visuals.")
-                fallback_explainer_visuals(clf_pipeline, X_test_df, y_test_arr, le_target, class_names, idx)
+                # ExplainerDashboard not installed
+                st.markdown("ExplainerDashboard not installed in this environment. Install `explainerdashboard` to enable a full interactive embedded dashboard.")
+                st.info("Showing fallback diagnostics (no SHAP visuals).")
+                # fallback diagnostics (same as above)
+                try:
+                    cm = confusion_matrix(y_test_arr, test_results["y_pred"])
+                    st.markdown("**Confusion Matrix**")
+                    cm_df = pd.DataFrame(cm)
+                    st.dataframe(cm_df)
+                except Exception:
+                    st.info("Confusion matrix not available.")
+                try:
+                    if hasattr(clf_pipeline, "predict_proba"):
+                        proba = clf_pipeline.predict_proba(X_test_df)
+                        if proba.shape[1] == 2:
+                            fpr, tpr, _ = roc_curve(y_test_arr, proba[:, 1])
+                            roc_auc = auc(fpr, tpr)
+                            fig, ax = plt.subplots(figsize=(5, 3))
+                            ax.plot(fpr, tpr, label=f"AUC={roc_auc:.3f}")
+                            ax.plot([0, 1], [0, 1], "--", linewidth=0.7)
+                            ax.set_xlabel("False Positive Rate")
+                            ax.set_ylabel("True Positive Rate")
+                            ax.set_title("ROC curve")
+                            ax.legend()
+                            plt.tight_layout()
+                            st.pyplot(fig)
+                            precision, recall, _ = precision_recall_curve(y_test_arr, proba[:, 1])
+                            fig2, ax2 = plt.subplots(figsize=(5, 3))
+                            ax2.plot(recall, precision)
+                            ax2.set_xlabel("Recall")
+                            ax2.set_ylabel("Precision")
+                            ax2.set_title("Precision-Recall")
+                            plt.tight_layout()
+                            st.pyplot(fig2)
+                        else:
+                            st.info("ROC/PR: multi-class or no binary probability available.")
+                    else:
+                        st.info("No predict_proba available for ROC/PR.")
+                except Exception:
+                    st.info("ROC/PR generation failed.")
 
             st.markdown("---")
-            # Partial Dependence Plot (approx)
+            # Partial Dependence Plot (approx) — keep as a small, helpful diagnostic
             st.markdown("### Partial Dependence Plot (approx)")
             try:
                 numeric_cols = X_test_df.select_dtypes(include=np.number).columns.tolist()
                 if not numeric_cols:
-                    st.info("No numeric features available for PDP.")
+                    st.info("No numeric features available for a PDP.")
                 else:
                     pdp_feat = st.selectbox("Choose numeric feature for PDP", numeric_cols, index=0)
                     base_row = X_test_df.iloc[[idx]].copy().reset_index(drop=True)
@@ -822,22 +804,19 @@ with tab3:
                     pdp_preds = make_pdp_values(clf_pipeline, base_row, pdp_feat, grid)
                     fig, ax = plt.subplots(figsize=(5, 3))
                     ax.plot(grid, pdp_preds, linewidth=1.6, marker="o", markersize=3)
-                    ax.set_xlabel(pdp_feat, fontsize=10)
-                    ax.set_ylabel("Predicted output / prob", fontsize=10)
-                    ax.tick_params(axis="x", labelsize=9)
-                    ax.tick_params(axis="y", labelsize=9)
+                    ax.set_xlabel(pdp_feat)
+                    ax.set_ylabel("Predicted output / prob")
                     plt.tight_layout()
                     st.pyplot(fig)
-            except Exception as e:
-                st.error(f"PDP failed: {e}")
-                st.text(traceback.format_exc())
+            except Exception:
+                st.info("PDP generation failed or not applicable.")
 
 # -------------------------
-# TAB 4: Predictions
+# TAB 4: PREDICTIONS
 # -------------------------
 with tab4:
     st.header("📈 Predictions")
-    st.markdown("Upload new data (CSV/XLSX) with the same features used in training to get predictions and download results.")
+    st.markdown("Upload a file with the same features used in training and get predictions with a CSV download.")
     if not st.session_state.data_uploaded:
         st.info("👈 Upload data first.")
     elif not st.session_state.model_trained:
@@ -863,7 +842,7 @@ with tab4:
                 else:
                     features_df = new_df[trained_feature_cols]
                     if extra:
-                        st.warning(f"Ignoring extra columns: {extra[:5]}{'...' if len(extra)>5 else ''}")
+                        st.warning(f"Ignoring extra columns: {extra[:5]}{'...' if len(extra) > 5 else ''}")
                     if st.button("🔮 Generate Predictions", use_container_width=True):
                         with st.spinner("Predicting..."):
                             try:
@@ -894,7 +873,7 @@ with tab4:
                                 st.success(f"Predicted {len(results)} rows.")
                                 st.dataframe(results, use_container_width=True)
 
-                                base = safe_filename_from_upload(new_file.name)
+                                base = safe_filename_base(new_file.name)
                                 fname = f"predictions_{base}.csv"
                                 csv_buf = io.StringIO()
                                 results.to_csv(csv_buf, index=False)
