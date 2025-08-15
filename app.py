@@ -487,7 +487,7 @@ with tab3:
                 st.pyplot(fig_cm)
             with col2:
                 # Plain-language explanation
-                st.markdown("**Easy explanation:**")
+                st.markdown("**What does this mean?**")
                 st.write("Each row here is the actual class, and each column is the model's guess. Values show two things:")
                 st.write("- Top: proportion of the actual class that the model predicted as that column (decimal).")
                 st.write("- Bottom: raw count of samples.")
@@ -544,7 +544,7 @@ with tab3:
                     st.pyplot(fig_pr)
 
                 # plain language
-                st.markdown("**What to look for (plain language):**")
+                st.markdown("**What does this mean?**")
                 st.write("- ROC AUC near 1.0 is great; 0.5 means guessing.")
                 st.write("- Precision–Recall shows how precise positive predictions are across recall levels. Use it when classes are imbalanced.")
             elif proba is not None and proba.ndim == 2 and proba.shape[1] > 2:
@@ -568,7 +568,7 @@ with tab3:
                     ax_mc.legend(fontsize=8, loc="lower right")
                     plt.tight_layout()
                     st.pyplot(fig_mc)
-                    st.markdown("**Plain language:** Each line shows how well the model separates one class from the rest. Higher is better.")
+                    st.markdown("**What does this mean?** Each line shows how well the model separates one class from the rest. Higher is better.")
                 else:
                     st.info("ROC per-class not available for this model/data.")
             else:
@@ -647,7 +647,7 @@ with tab3:
                 with col1:
                     st.pyplot(fig_pdp)
                 with col2:
-                    st.markdown("**In plain language:**")
+                    st.markdown("**What does this mean?**")
                     st.write("This plot shows how changing this feature (left to right) tends to change the model's predicted score/probability, holding other features near the selected sample.")
                     st.write("A rising line means higher values increase model confidence; a flat line means that feature doesn't change predictions much.")
         except Exception:
