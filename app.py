@@ -1,24 +1,6 @@
-# app.py
+# app_fixed.py
 # Predictive Analytics App with Comprehensive ExplainerDashboard
-# - No reset logic
-# - Data persists across tabs
-# - Profiling enabled (ydata-profiling fallback)
-# - Auto-select random index for explainer
-# - Robust SHAP contributions logic (no length mismatch)
-# - Compact charts & fonts (≈10pt)
-# - Comprehensive ExplainerDashboard integration (per docs)
-#
-# Requirements (put in requirements.txt for Streamlit Cloud):
-# streamlit
-# pandas
-# numpy
-# scikit-learn
-# imbalanced-learn
-# explainerdashboard
-# ydata-profiling
-# shap
-# matplotlib
-# openpyxl
+# Cleaned & fixed version
 
 import matplotlib
 matplotlib.use("Agg")
@@ -84,25 +66,22 @@ except Exception:
 # -----------------------------
 st.set_page_config(page_title="Predictive Analytics App", layout="wide", page_icon="📊")
 
-# Session state initialization
-if 'data_uploaded' not in st.session_state:
-    st.session_state.data_uploaded = False
-if 'profile_generated' not in st.session_state:
-    st.session_state.profile_generated = False
-if 'model_trained' not in st.session_state:
-    st.session_state.model_trained = False
-if 'current_file' not in st.session_state:
-    st.session_state.current_file = None
-if 'data' not in st.session_state:
-    st.session_state.data = None
-if 'profile_html' not in st.session_state:
-    st.session_state.profile_html = None
-if 'explainer_selected_index' not in st.session_state:
-    st.session_state.explainer_selected_index = None
+for key, val in {
+    'data_uploaded': False,
+    'profile_generated': False,
+    'model_trained': False,
+    'current_file': None,
+    'data': None,
+    'profile_html': None,
+    'explainer_selected_index': None
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = val
 
 # -----------------------------
 # Helper functions
 # -----------------------------
+
 def class_counts(y_arr):
     vc = pd.Series(y_arr).value_counts().sort_index()
     return {str(k): int(v) for k, v in vc.items()}
@@ -110,7 +89,7 @@ def class_counts(y_arr):
 @st.cache_data
 def load_data(uploaded_file):
     if uploaded_file:
-        if uploaded_file.name.endswith(".csv"):
+        if uploaded_file.name.lower().endswith(".csv"):
             return pd.read_csv(uploaded_file)
         else:
             return pd.read_excel(uploaded_file)
@@ -130,8 +109,10 @@ def generate_profile_report(data):
     )
     return profile.to_html()
 
+
 def safe_shap_explainer(fitted_model, background_data, feature_names=None):
     try:
+        # shap.Explainer has different signatures across versions; guard it
         if feature_names is not None:
             return shap.Explainer(fitted_model, background_data, feature_names=feature_names)
         return shap.Explainer(fitted_model, background_data)
@@ -141,8 +122,10 @@ def safe_shap_explainer(fitted_model, background_data, feature_names=None):
         except Exception:
             return None
 
+
 def ensure_shap_array_for_idx(shap_values_obj, idx):
     try:
+        # Handle numpy arrays directly
         if isinstance(shap_values_obj, np.ndarray):
             arr = shap_values_obj
             if arr.ndim == 2:
@@ -158,22 +141,23 @@ def ensure_shap_array_for_idx(shap_values_obj, idx):
                     return arr[0].ravel()
             if arr.ndim == 1:
                 return arr.ravel()
-        else:
-            try:
-                vals = shap_values_obj.values
-            except Exception:
-                vals = shap_values_obj
-            vals = np.array(vals)
-            if vals.ndim == 2:
-                return vals[idx].ravel()
-            if vals.ndim == 3:
-                sample_vals = vals[idx]
-                out_idx = int(np.argmax(np.abs(sample_vals).mean(axis=1)))
-                return sample_vals[out_idx].ravel()
-            if vals.ndim == 1:
-                return vals.ravel()
+        # Try to access .values for shap.Explanation objects
+        try:
+            vals = shap_values_obj.values
+        except Exception:
+            vals = shap_values_obj
+        vals = np.array(vals)
+        if vals.ndim == 2:
+            return vals[idx].ravel()
+        if vals.ndim == 3:
+            sample_vals = vals[idx]
+            out_idx = int(np.argmax(np.abs(sample_vals).mean(axis=1)))
+            return sample_vals[out_idx].ravel()
+        if vals.ndim == 1:
+            return vals.ravel()
     except Exception:
         return None
+
 
 def make_pdp_values(clf_pipeline, base_row_df, feature, grid):
     preds = []
@@ -183,6 +167,7 @@ def make_pdp_values(clf_pipeline, base_row_df, feature, grid):
         try:
             if hasattr(clf_pipeline, "predict_proba"):
                 p = clf_pipeline.predict_proba(temp)
+                # return top class probability as the PDP proxy
                 preds.append(float(np.max(p)))
             else:
                 p = clf_pipeline.predict(temp)
@@ -191,8 +176,10 @@ def make_pdp_values(clf_pipeline, base_row_df, feature, grid):
             preds.append(np.nan)
     return preds
 
+
 def st_plt(fig):
     st.pyplot(fig)
+
 
 # -----------------------------
 # Main UI
@@ -374,11 +361,18 @@ with tab2:
         numeric_feats = X.select_dtypes(include=np.number).columns.tolist()
         categorical_feats = X.select_dtypes(exclude=np.number).columns.tolist()
         numeric_transformer = Pipeline([("scaler", StandardScaler())])
-        categorical_transformer = Pipeline([("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False))])
+
+        # OneHotEncoder's sparse parameter name changed across sklearn versions; handle both
+        try:
+            ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+        except TypeError:
+            ohe = OneHotEncoder(handle_unknown="ignore", sparse=False)
+
+        categorical_transformer = Pipeline([("onehot", ohe)])
         preprocessor = ColumnTransformer([
             ("num", numeric_transformer, numeric_feats),
             ("cat", categorical_transformer, categorical_feats),
-        ])
+        ], remainder='drop')
 
         if sampler is None:
             clf_pipeline = ImbPipeline(steps=[("preprocessor", preprocessor), ("classifier", model)])
@@ -708,7 +702,7 @@ with tab4:
         new_file = st.file_uploader("Upload CSV/XLSX with same features", type=["csv", "xlsx"], key="pred_file")
         if new_file:
             try:
-                if new_file.name.endswith(".csv"):
+                if new_file.name.lower().endswith(".csv"):
                     new_df = pd.read_csv(new_file)
                 else:
                     new_df = pd.read_excel(new_file)
@@ -761,4 +755,4 @@ with tab4:
 
 # Footer
 st.markdown("---")
-st.markdown("Built with ❤️ using Streamlit | © 2025 CE Team Predictive Analytics Platform")
+st.markdown("Built with ❤️ using Streamlit | © 2025 CE Innovation Lab")
