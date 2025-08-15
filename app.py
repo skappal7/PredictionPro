@@ -32,7 +32,13 @@ from pathlib import Path
 import io
 
 # 3) Data Profiling
-from ydata_profiling import ProfileReport
+try:
+    from ydata_profiling import ProfileReport
+except ImportError:
+    try:
+        from pandas_profiling import ProfileReport
+    except ImportError:
+        ProfileReport = None
 
 # 4) ML stack
 from sklearn.model_selection import train_test_split
@@ -65,24 +71,8 @@ if 'profile_generated' not in st.session_state:
     st.session_state.profile_generated = False
 if 'model_trained' not in st.session_state:
     st.session_state.model_trained = False
-if 'show_warning' not in st.session_state:
-    st.session_state.show_warning = False
-if 'warning_message' not in st.session_state:
-    st.session_state.warning_message = ""
 
 # Helper functions
-def reset_downstream_states(from_step):
-    """Reset all states downstream from the given step"""
-    if from_step <= 1:  # Data upload changed
-        st.session_state.profile_generated = False
-        st.session_state.model_trained = False
-        st.session_state.show_warning = True
-        st.session_state.warning_message = "⚠️ New data uploaded. All previous work has been reset."
-    elif from_step <= 2:  # Model development changed
-        st.session_state.model_trained = False
-        st.session_state.show_warning = True
-        st.session_state.warning_message = "⚠️ Model settings changed. Please retrain the model to continue."
-
 def class_counts(y_arr):
     vc = pd.Series(y_arr).value_counts().sort_index()
     return {str(k): int(v) for k, v in vc.items()}
@@ -99,6 +89,9 @@ def load_data(uploaded_file):
 @st.cache_data
 def generate_profile_report(data):
     """Generate YData Profiling report"""
+    if ProfileReport is None:
+        return "<h1>Data Profiling library not available</h1><p>Please install ydata-profiling or pandas-profiling</p>"
+    
     profile = ProfileReport(
         data, 
         title="Dataset Profiling Report",
@@ -127,15 +120,11 @@ with st.sidebar:
     )
     
     if uploaded_file:
-        # Check if this is a new file
-        if 'current_file' not in st.session_state or st.session_state.current_file != uploaded_file.name:
-            reset_downstream_states(1)
-            st.session_state.current_file = uploaded_file.name
-        
         data = load_data(uploaded_file)
         if data is not None:
             st.session_state.data = data
             st.session_state.data_uploaded = True
+            st.session_state.current_file = uploaded_file.name
             
             st.success("✅ Data uploaded successfully!")
             st.write(f"**Shape:** {data.shape}")
@@ -147,12 +136,7 @@ with st.sidebar:
     else:
         st.session_state.data_uploaded = False
 
-# Display warning message if exists
-if st.session_state.show_warning:
-    st.warning(st.session_state.warning_message)
-    if st.button("✓ Acknowledge", key="ack_warning"):
-        st.session_state.show_warning = False
-        st.rerun()
+# Display warning message if exists - REMOVED
 
 # -----------------------------
 # Tab Structure
@@ -196,15 +180,18 @@ with tab1:
         with col4:
             st.metric("Missing Values", data.isnull().sum().sum())
         
-        if st.button("🔍 Generate Comprehensive Profile Report", type="primary"):
-            with st.spinner("Generating detailed profiling report... This may take a moment."):
-                try:
-                    profile_html = generate_profile_report(data)
-                    st.session_state.profile_html = profile_html
-                    st.session_state.profile_generated = True
-                    st.success("✅ Profile report generated successfully!")
-                except Exception as e:
-                    st.error(f"Error generating profile: {str(e)}")
+        if st.button("🔍 Generate Comprehensive Profile Report", type="primary", disabled=(ProfileReport is None)):
+            if ProfileReport is None:
+                st.error("Data profiling library not installed. Please install: pip install ydata-profiling")
+            else:
+                with st.spinner("Generating detailed profiling report... This may take a moment."):
+                    try:
+                        profile_html = generate_profile_report(data)
+                        st.session_state.profile_html = profile_html
+                        st.session_state.profile_generated = True
+                        st.success("✅ Profile report generated successfully!")
+                    except Exception as e:
+                        st.error(f"Error generating profile: {str(e)}")
         
         # Display profile report if generated
         if st.session_state.profile_generated and 'profile_html' in st.session_state:
@@ -242,12 +229,6 @@ with tab2:
             help="This is the variable your model will learn to predict"
         )
         
-        # Check if target changed
-        if 'previous_target' not in st.session_state or st.session_state.previous_target != target_column:
-            if 'previous_target' in st.session_state:  # Not first time
-                reset_downstream_states(2)
-            st.session_state.previous_target = target_column
-        
         # Feature Selection
         st.subheader("🔧 Feature Selection")
         st.markdown("Choose which variables to use as inputs for your model (independent variables).")
@@ -274,11 +255,9 @@ with tab2:
         else:
             feature_cols = available_features
         
-        # Check if features changed
-        if 'previous_features' not in st.session_state or st.session_state.previous_features != feature_cols:
-            if 'previous_features' in st.session_state:  # Not first time
-                reset_downstream_states(2)
-            st.session_state.previous_features = feature_cols
+        # Store selections in session state
+        st.session_state.target_column = target_column
+        st.session_state.feature_cols = feature_cols
         
         st.info(f"✓ Selected {len(feature_cols)} features: {feature_cols[:3]}{'...' if len(feature_cols) > 3 else ''}")
         
