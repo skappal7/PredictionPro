@@ -4,7 +4,6 @@ numpy>=2.1.0
 ydata-profiling>=4.5.1
 scikit-learn>=1.5.0
 imbalanced-learn>=0.14.0
-explainerdashboard==0.4.0
 shap>=0.48.0
 lime==0.2.0.0
 matplotlib>=3.10.0
