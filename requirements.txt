@@ -1,16 +1,23 @@
-streamlit==1.48.1
-pandas==2.2.2
-numpy==1.26.4
-pandas-profiling==3.6.6
-scikit-learn==1.3.2
-imbalanced-learn==0.12.0
-explainerdashboard==0.4.5
-shap==0.46.0
-lime==0.2.0.1
-matplotlib==3.8.3
+# Data Manipulation and Analysis
+pandas==2.2.0
+numpy==1.26.0
+
+# Profiling and Visualization
+ydata-profiling==4.5.1
+matplotlib==3.8.2
 seaborn==0.13.2
-openpyxl==3.1.5
-xlsxwriter==3.2.5
+plotly==5.18.0
+
+# Machine Learning
+scikit-learn==1.3.2
+imbalanced-learn==0.11.0
+
+# Explainability
+shap==0.45.0
+lime==0.2.0.0
+
+# File Handling and Utilities
+openpyxl==3.1.3
+xlsxwriter==3.2.0
+joblib==1.3.2
 pathlib2==2.3.7.post1
-joblib==1.4.2
-plotly==5.22.0
