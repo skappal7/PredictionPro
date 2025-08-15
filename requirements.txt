@@ -4,8 +4,8 @@ numpy
 scikit-learn
 imbalanced-learn
 ydata-profiling
-explainerdashboard
-plotly
+explainerdashboard>=0.4.6
+plotly<=5.14.1
 shap
 matplotlib
 openpyxl
