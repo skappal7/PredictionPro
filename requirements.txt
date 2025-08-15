@@ -1,5 +1,4 @@
 streamlit
-streamlit-components
 pandas
 numpy
 ydata-profiling
