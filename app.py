@@ -1,11 +1,10 @@
 # app.py
 """
-Full Predictive Analytics Streamlit App
-- Robust profiling sanitization + safe profile generation (no caching)
-- ExplainerDashboard HTML patch to remove Plotly 'titlefont' incompatibilities
-- Compact SHAP visuals (only used when dashboard unavailable)
-- Uses sklearn pipelines, imbalanced-learn if available
-- Safe, defensive programming with user-facing error messages
+Predictive Analytics Streamlit App — Full Version (fixed)
+- Robust profiling with sanitization + fallback HTML if ProfileReport.to_html fails
+- ExplainerDashboard attempted; if it fails (Plotly titlefont error), show internal fallback explainer visuals
+- Compact SHAP visuals and safe pipeline handling
+- Defensive programming and user guidance
 """
 
 import io
@@ -36,7 +35,7 @@ import pandas as pd
 import numpy as np
 
 # -------------------------
-# Optional libs (safe guards)
+# Optional libs (safeguarded)
 # -------------------------
 # Profiling
 try:
@@ -66,7 +65,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.svm import SVC
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, roc_curve, auc, precision_recall_curve
 
 # imbalanced-learn
 try:
@@ -95,14 +94,14 @@ except Exception:
     EXPLAINERDASH_AVAILABLE = False
 
 # -------------------------
-# Streamlit page config + state defaults
+# Page config and session defaults
 # -------------------------
 st.set_page_config(page_title="Predictive Analytics App", layout="wide", page_icon="📊")
 st.title("📊 Predictive Analytics — Explorer & Explainer")
-st.markdown("Upload dataset → Profile → Train → Explain → Predict.")
+st.markdown("Upload dataset → profile → train → explain → predict.")
 
-# Session state defaults
-_defaults = {
+# session defaults
+_default_keys = {
     "data_uploaded": False,
     "profile_generated": False,
     "model_trained": False,
@@ -111,7 +110,7 @@ _defaults = {
     "profile_html": None,
     "explainer_selected_index": None,
 }
-for k, v in _defaults.items():
+for k, v in _default_keys.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
@@ -123,7 +122,7 @@ def class_counts(y_arr):
     return {str(k): int(v) for k, v in vc.items()}
 
 def load_data_safe(uploaded_file):
-    """Load CSV or Excel safely."""
+    """Load CSV or Excel safely, with fallback attempts."""
     try:
         name = uploaded_file.name.lower()
         if name.endswith(".csv"):
@@ -131,7 +130,6 @@ def load_data_safe(uploaded_file):
         else:
             return pd.read_excel(uploaded_file)
     except Exception:
-        # try alternate read strategies
         try:
             uploaded_file.seek(0)
             return pd.read_excel(uploaded_file)
@@ -140,80 +138,96 @@ def load_data_safe(uploaded_file):
             return pd.read_csv(uploaded_file)
 
 def is_scalar_value(v):
-    """Return True if v is a scalar-like value (not list/dict/tuple/ndarray/Series)."""
     return not isinstance(v, (list, dict, set, tuple, np.ndarray, pd.Series))
 
 def sanitize_dataframe_for_profiling(df: pd.DataFrame, check_n=50):
     """
-    Sanitize DataFrame before passing to ProfileReport:
-    - ensure DataFrame
-    - drop all-empty columns
-    - drop constant columns (nunique <= 1)
-    - drop columns where some values are nested non-scalar (list/dict/ndarray)
-    - coerce object-like columns that are entirely numeric strings to numeric
-    - reset index
+    Sanitize DataFrame before profiling:
+      - Ensure DataFrame type
+      - Drop fully-empty columns
+      - Attempt to coerce object columns that are numeric-like
+      - Drop columns that contain nested or non-scalar values (lists/dicts/arrays)
+      - Drop constant columns (nunique <= 1)
+      - Reset index
     """
     if df is None:
         return pd.DataFrame()
     if not isinstance(df, pd.DataFrame):
         df = pd.DataFrame(df)
-
-    # Drop completely empty columns
     df = df.dropna(axis=1, how="all")
-
-    # Coerce object columns that look numeric
+    # coerce object cols that look numeric
     for col in df.columns:
         if df[col].dtype == "object":
-            # check if all non-null values can be coerced to numeric
-            nonnull_vals = df[col].dropna().head(check_n)
+            nonnull = df[col].dropna().head(check_n)
             try:
-                coerced = pd.to_numeric(nonnull_vals)
-                # if at least 90% coerced or lengths match, convert full column
-                if len(coerced) >= len(nonnull_vals) * 0.9:
+                coerced = pd.to_numeric(nonnull)
+                if len(coerced) >= len(nonnull) * 0.9:
                     df[col] = pd.to_numeric(df[col], errors="coerce")
             except Exception:
                 pass
-
-    # Identify and drop columns with nested structures
+    # drop nested-type columns
     drop_cols = []
     for col in df.columns:
-        # sample up to check_n non-null values
-        sample_vals = df[col].dropna().head(check_n).tolist()
-        for v in sample_vals:
+        sample = df[col].dropna().head(check_n).tolist()
+        for v in sample:
             if not is_scalar_value(v):
                 drop_cols.append(col)
                 break
     if drop_cols:
         df = df.drop(columns=list(set(drop_cols)))
-
-    # Drop constant columns
+    # drop constant columns
     nunique = df.nunique(dropna=False)
-    keep_cols = nunique[nunique > 1].index.tolist()
-    df = df.loc[:, keep_cols]
-
-    # Reset index
+    keep = nunique[nunique > 1].index.tolist()
+    df = df.loc[:, keep]
     df = df.reset_index(drop=True)
     return df
 
-def generate_profile_report_safe(df):
-    """Generate profile HTML safely. NEVER cache this function."""
+def generate_profile_report_safe(df: pd.DataFrame):
+    """
+    Generate profiling HTML:
+      - Try ProfileReport.to_html(); if that fails, provide fallback HTML containing
+        basic pandas summaries so profiling never raises an exception for the app.
+    """
     if ProfileReport is None:
-        return "<h3>Profiling library not available</h3><p>Install ydata-profiling or pandas-profiling.</p>"
+        return "<h3>Profiling library not available</h3><p>Install 'ydata-profiling' or 'pandas-profiling' to enable full reports.</p>"
     try:
         df_s = sanitize_dataframe_for_profiling(df)
         if df_s.shape[1] == 0:
-            return "<h3>No columns available to profile after sanitization</h3>"
+            return "<h3>No columns available to profile after sanitization.</h3>"
         profile = ProfileReport(df_s, title="Dataset Profiling Report", explorative=True)
         try:
-            html_out = profile.to_html()
-            return html_out
-        except Exception as e:
-            # sometimes to_html fails — try fallback summarization HTML with traceback
-            tb = traceback.format_exc()
-            return f"<h3>Profiling failed during to_html()</h3><pre>{html.escape(tb)}</pre>"
-    except Exception as e:
+            return profile.to_html()
+        except Exception:
+            # fallback: build HTML from pandas summaries
+            try:
+                html_parts = []
+                html_parts.append("<h2>Fallback Profiling Report</h2>")
+                html_parts.append("<p><em>ProfileReport.to_html() failed — presenting a pandas-based fallback summary.</em></p>")
+                html_parts.append("<h3>Sample (first 10 rows)</h3>")
+                html_parts.append(df_s.head(10).to_html(classes='table table-striped', index=False))
+                html_parts.append("<h3>Column dtypes</h3>")
+                html_parts.append(df_s.dtypes.to_frame("dtype").to_html(classes='table table-striped'))
+                html_parts.append("<h3>Null counts</h3>")
+                nulls = df_s.isnull().sum()
+                html_parts.append(nulls.to_frame("null_count").to_html(classes='table table-striped'))
+                html_parts.append("<h3>Unique counts (top 10)</h3>")
+                uniq = df_s.nunique().sort_values()
+                html_parts.append(uniq.to_frame("unique_count").to_html(classes='table table-striped'))
+                html_parts.append("<h3>Descriptive statistics (numeric)</h3>")
+                html_parts.append(df_s.describe().T.to_html(classes='table table-striped'))
+                try:
+                    corr = df_s.corr()
+                    html_parts.append("<h3>Correlation (pearson) — numeric cols</h3>")
+                    html_parts.append(corr.to_html(classes='table table-striped'))
+                except Exception:
+                    pass
+                return "<html><body style='font-family:Arial, Helvetica, sans-serif; padding:10px'>" + "".join(html_parts) + "</body></html>"
+            except Exception:
+                tb = traceback.format_exc()
+                return f"<h3>Profiling fallback generation failed</h3><pre>{html.escape(tb)}</pre>"
+    except Exception:
         tb = traceback.format_exc()
-        return f"<h3>Profiling sanitization or generation failed</h3><pre>{html.escape(tb)}</pre>"
+        return f"<h3>Profiling sanitization failed</h3><pre>{html.escape(tb)}</pre>"
 
 def safe_onehot_encoder():
     try:
@@ -221,44 +235,40 @@ def safe_onehot_encoder():
     except TypeError:
         return OneHotEncoder(handle_unknown="ignore", sparse=False)
 
-def safe_shap_explainer(model, background_data, feature_names=None):
+def safe_shap_explainer(fitted_model, background_data, feature_names=None):
     if not SHAP_AVAILABLE:
         return None
     try:
         if feature_names is not None:
-            return shap.Explainer(model, background_data, feature_names=feature_names)
-        return shap.Explainer(model, background_data)
+            return shap.Explainer(fitted_model, background_data, feature_names=feature_names)
+        return shap.Explainer(fitted_model, background_data)
     except Exception:
         try:
-            return shap.Explainer(model, background_data)
+            return shap.Explainer(fitted_model, background_data)
         except Exception:
             return None
 
-def ensure_shap_array_for_idx(shap_vals, idx):
-    """Try to coerce many possible shap outputs into a 1D array (per sample)."""
+def ensure_shap_array_for_idx(vals_obj, idx):
     try:
-        # if shap.Explanation object
-        if hasattr(shap_vals, "values"):
-            vals = shap_vals.values
+        if hasattr(vals_obj, "values"):
+            vals = vals_obj.values
         else:
-            vals = shap_vals
+            vals = vals_obj
         arr = np.array(vals)
         if arr.ndim == 1:
             return arr.ravel()
         if arr.ndim == 2:
-            # shape (samples, features) or (classes, features)
             return arr[idx].ravel()
         if arr.ndim == 3:
-            # could be (classes, samples, features) or (samples, classes, features)
-            # prefer sample-first
+            # attempt sample-first
             if arr.shape[0] == len(vals):
                 return arr[idx].ravel()
-            # else choose class with max mean abs
-            sample_vals = arr[:, idx, :] if arr.shape[1] == len(vals) else arr[idx]
-            if sample_vals.ndim == 2:
-                out_idx = int(np.argmax(np.abs(sample_vals).mean(axis=1)))
-                return sample_vals[out_idx].ravel()
-            return sample_vals.ravel()
+            # fallback: choose class with largest mean abs
+            s = arr[idx]
+            if s.ndim == 2:
+                out_idx = int(np.argmax(np.abs(s).mean(axis=1)))
+                return s[out_idx].ravel()
+            return s.ravel()
     except Exception:
         return None
 
@@ -286,7 +296,6 @@ def compact_shap_summary_plot(shap_values, X):
         plt.tight_layout()
         return fig
     except Exception:
-        # fallback simple bar
         arr = np.abs(np.array(shap_values))
         if arr.ndim == 3:
             mean_imp = np.mean(np.mean(arr, axis=1), axis=0)
@@ -302,48 +311,157 @@ def compact_shap_summary_plot(shap_values, X):
         plt.tight_layout()
         return fig
 
-def patch_plotly_titlefont_in_html(html_str):
-    """
-    Aggressively patch known Plotly layout keys that cause 'titlefont' errors.
-    We replace various patterns:
-      - "titlefont": { ... }  -> "title_font": { ... }
-      - .titlefont = { ... }  -> .title_font = { ... } (JS)
-      - yaxis.titlefont -> yaxis.title_font
-    Also remove occurrences of unknown/unsupported keys if necessary.
-    """
-    if not isinstance(html_str, str):
-        return html_str
-    s = html_str
-
-    # 1) Replace JSON-style "titlefont":{...}  -> "title_font":{...}
-    s = re.sub(r'("titlefont"\s*:\s*)\{', r'"title_font": {', s)
-
-    # 2) Replace JS assignments like .titlefont = { ... }  -> .title_font = { ... }
-    s = re.sub(r'(\.titlefont\s*=\s*)\{', r'.title_font = {', s)
-
-    # 3) Replace property references like yaxis.titlefont -> yaxis.title_font (JS dot access)
-    s = re.sub(r'\.titlefont\b', r'.title_font', s)
-
-    # 4) Replace object keys without quotes: titlefont: { ... } -> title_font: { ... } (simple)
-    s = re.sub(r'(\btitlefont\s*:\s*)\{', r'title_font: {', s)
-
-    # 5) Some dashboard versions may use 'titlefont' nested; remove problematic 'titlefont' blocks entirely if still present
-    # Remove `"title_font": { ... }` that may have incompatible nested content only as last resort
-    s = re.sub(r'"title_font"\s*:\s*\{[^}]*\}\s*,?', r'', s)
-
-    return s
-
 def safe_filename_from_upload(name: str):
-    """Produce a safe filename base (no dots except extension)"""
     base = Path(name).stem
-    return re.sub(r'[^A-Za-z0-9_\-]', '_', base)
+    return re.sub(r"[^A-Za-z0-9_\-]", "_", base)
+
+def fallback_explainer_visuals(clf_pipeline, X_test_df, y_test_arr, le_target, class_names, idx):
+    """
+    If ExplainerDashboard cannot be constructed, show a set of fallback visuals:
+    - Confusion matrix
+    - ROC curve (if binary or probability available)
+    - Precision-recall curve
+    - Feature importances (if available)
+    - SHAP summary + local contributions (if SHAP available)
+    """
+    st.subheader("Fallback Explainer Visuals")
+    st.markdown("ExplainerDashboard failed to initialize in your environment; showing equivalent analysis here.")
+    y_true = np.array(y_test_arr)
+    y_pred = clf_pipeline.predict(X_test_df)
+    try:
+        # Confusion matrix
+        cm = confusion_matrix(y_true, y_pred)
+        st.markdown("**Confusion Matrix**")
+        cm_df = pd.DataFrame(cm)
+        st.dataframe(cm_df)
+    except Exception:
+        st.info("Confusion matrix not available.")
+
+    # ROC / AUC (if probability and binary)
+    try:
+        if hasattr(clf_pipeline, "predict_proba"):
+            proba = clf_pipeline.predict_proba(X_test_df)
+            if proba.shape[1] == 2:
+                fpr, tpr, _ = roc_curve(y_true, proba[:, 1])
+                roc_auc = auc(fpr, tpr)
+                fig, ax = plt.subplots(figsize=(5, 3))
+                ax.plot(fpr, tpr, label=f"AUC={roc_auc:.3f}")
+                ax.plot([0, 1], [0, 1], "--", linewidth=0.7)
+                ax.set_xlabel("False Positive Rate")
+                ax.set_ylabel("True Positive Rate")
+                ax.set_title("ROC curve")
+                ax.legend()
+                plt.tight_layout()
+                st.pyplot(fig)
+            else:
+                st.info("ROC curve requires binary problem or probability for positive class.")
+        else:
+            st.info("No predict_proba available for ROC curve.")
+    except Exception:
+        st.info("ROC curve generation failed.")
+
+    # Precision-Recall
+    try:
+        if hasattr(clf_pipeline, "predict_proba"):
+            proba = clf_pipeline.predict_proba(X_test_df)
+            if proba.shape[1] == 2:
+                precision, recall, _ = precision_recall_curve(y_true, proba[:, 1])
+                fig, ax = plt.subplots(figsize=(5, 3))
+                ax.plot(recall, precision)
+                ax.set_xlabel("Recall")
+                ax.set_ylabel("Precision")
+                ax.set_title("Precision-Recall")
+                plt.tight_layout()
+                st.pyplot(fig)
+    except Exception:
+        st.info("Precision-Recall generation failed.")
+
+    # Feature importances (tree-based)
+    try:
+        # attempt to get classifier from pipeline
+        if isinstance(clf_pipeline, Pipeline) or hasattr(clf_pipeline, "named_steps"):
+            try:
+                clf = clf_pipeline.named_steps.get("classifier", None) or clf_pipeline.steps[-1][1]
+            except Exception:
+                clf = clf_pipeline
+        else:
+            clf = clf_pipeline
+        if hasattr(clf, "feature_importances_"):
+            st.markdown("**Feature importances**")
+            fi = np.array(clf.feature_importances_)
+            # try to get feature names
+            try:
+                pre = clf_pipeline.named_steps.get("preprocessor", None)
+                if pre is not None and hasattr(pre, "get_feature_names_out"):
+                    feat_names = pre.get_feature_names_out()
+                else:
+                    feat_names = X_test_df.columns.tolist()
+            except Exception:
+                feat_names = X_test_df.columns.tolist()
+            fi_df = pd.DataFrame({"feature": feat_names, "importance": fi})
+            fi_df = fi_df.sort_values("importance", ascending=False).head(20)
+            st.dataframe(fi_df, use_container_width=True)
+            fig, ax = plt.subplots(figsize=(5, 3))
+            ax.barh(fi_df["feature"][::-1], fi_df["importance"][::-1])
+            plt.tight_layout()
+            st.pyplot(fig)
+    except Exception:
+        pass
+
+    # SHAP visuals (if SHAP available)
+    if SHAP_AVAILABLE:
+        try:
+            pre = None
+            try:
+                pre = clf_pipeline.named_steps.get("preprocessor", None)
+            except Exception:
+                pre = None
+            # background
+            try:
+                bg = pre.transform(X_test_df) if pre is not None else X_test_df.values
+            except Exception:
+                bg = X_test_df.values
+            expl = safe_shap_explainer(clf_pipeline.named_steps.get("classifier", clf_pipeline) if hasattr(clf_pipeline, "named_steps") else clf_pipeline, bg, feature_names=(pre.get_feature_names_out() if pre is not None and hasattr(pre, "get_feature_names_out") else X_test_df.columns.tolist()))
+            if expl is not None:
+                st.markdown("**SHAP global summary (compact)**")
+                X_for_shap = X_test_df.head(200)
+                try:
+                    shap_vals = expl(X_for_shap)
+                    shap_vals_to_plot = shap_vals.values if hasattr(shap_vals, "values") else shap_vals
+                    fig = compact_shap_summary_plot(shap_vals_to_plot, X_for_shap)
+                    st.pyplot(fig)
+                except Exception:
+                    st.info("SHAP global summary failed.")
+                st.markdown("**SHAP local contributions (for selected index)**")
+                try:
+                    single = X_test_df.iloc[[idx]]
+                    single_proc = pre.transform(single) if pre is not None else single.values
+                    shap_out = expl(single_proc)
+                    local_vals = shap_out.values if hasattr(shap_out, "values") else shap_out
+                    local_arr = ensure_shap_array_for_idx(local_vals, 0)
+                    if local_arr is not None:
+                        feat_names = pre.get_feature_names_out() if pre is not None and hasattr(pre, "get_feature_names_out") else X_test_df.columns.tolist()
+                        contrib_df = pd.DataFrame({"feature": list(feat_names), "contribution": local_arr})
+                        contrib_df["abs_contrib"] = contrib_df["contribution"].abs()
+                        contrib_df = contrib_df.sort_values("abs_contrib", ascending=False).head(20)
+                        st.dataframe(contrib_df[["feature", "contribution"]], use_container_width=True)
+                        fig, ax = plt.subplots(figsize=(5, 3))
+                        ax.barh(contrib_df["feature"][::-1], contrib_df["contribution"][::-1])
+                        plt.tight_layout()
+                        st.pyplot(fig)
+                except Exception:
+                    st.info("SHAP local contributions failed.")
+        except Exception:
+            st.info("SHAP visuals generation failed or SHAP not supported for this model.")
+    else:
+        st.info("SHAP not installed; install 'shap' to see SHAP-based visuals.")
 
 # -------------------------
-# Sidebar: file upload
+# Sidebar: upload
 # -------------------------
 with st.sidebar:
     st.header("📁 Data Upload")
-    uploaded_file = st.file_uploader("Upload dataset (CSV/XLSX)", type=["csv", "xlsx"])
+    uploaded_file = st.file_uploader("Upload dataset (CSV or XLSX)", type=["csv", "xlsx"])
     st.markdown("---")
     st.write("Status:")
     st.write(f"- Data uploaded: {st.session_state.data_uploaded}")
@@ -374,7 +492,7 @@ tab1, tab2, tab3, tab4 = st.tabs(["📊 Data Profiling", "🚀 Model Development
 # -------------------------
 with tab1:
     st.header("📊 Data Profiling")
-    st.markdown("Generate a profiling report. The app sanitizes the dataset to remove problematic columns (lists/dicts/constant columns) before profiling.")
+    st.markdown("Generate a profiling report. The app sanitizes the dataset to remove problematic columns.")
     if not st.session_state.data_uploaded:
         st.info("👈 Please upload a dataset in the sidebar to begin profiling.")
     else:
@@ -389,13 +507,12 @@ with tab1:
             st.metric("Memory", f"{mem_mb:.1f} MB")
         with c4:
             st.metric("Missing values", int(df.isnull().sum().sum()))
-
         with st.expander("Quick preview"):
             st.dataframe(df.head())
 
         if st.button("🔍 Generate Comprehensive Profile Report"):
             if ProfileReport is None:
-                st.error("Profiling library not installed. Add 'ydata-profiling' or 'pandas-profiling' to your requirements.")
+                st.error("Profiling library not installed. Add 'ydata-profiling' or 'pandas-profiling' to requirements.")
             else:
                 with st.spinner("Generating profiling report..."):
                     try:
@@ -409,10 +526,8 @@ with tab1:
 
         if st.session_state.profile_generated and st.session_state.profile_html:
             st.subheader("📋 Profiling Report")
-            # If streamlit_pandas_profiling is available and expected to accept HTML, try that first
             if HAS_ST_PROFILE:
                 try:
-                    # st_profile_report expects a ProfileReport or HTML depending on version; wrap call defensively
                     st_profile_report(st.session_state.profile_html)
                 except Exception:
                     components.html(st.session_state.profile_html, height=700, scrolling=True)
@@ -424,7 +539,7 @@ with tab1:
 # -------------------------
 with tab2:
     st.header("🚀 Model Development")
-    st.markdown("Select target, features, algorithm, class balancing and train the model.")
+    st.markdown("Choose target, features, algorithm, balance classes and train the model.")
     if not st.session_state.data_uploaded:
         st.info("👈 Upload data first.")
     else:
@@ -497,7 +612,7 @@ with tab2:
         elif balance == "Random Undersample" and IMB_AVAILABLE:
             sampler = RandomUnderSampler(random_state=42)
         elif balance != "None" and not IMB_AVAILABLE:
-            st.warning("imbalanced-learn not installed; balancing disabled.")
+            st.warning("imbalanced-learn not installed — balancing options are disabled")
 
         st.subheader("📊 Train/Test Split")
         test_pct = st.slider("Test size (%)", 10, 50, 20)
@@ -551,7 +666,7 @@ with tab2:
 # -------------------------
 with tab3:
     st.header("🔍 Model Evaluation & Explainer")
-    st.markdown("Model metrics, local explanations and an embedded ExplainerDashboard (if installed). If the dashboard is available the app will rely on it for SHAP visualizations; otherwise compact SHAP visuals are shown here.")
+    st.markdown("Model performance, local explanations, PDP, and ExplainerDashboard (if available). The app will fall back to built-in visuals if the dashboard cannot initialize.")
 
     if not st.session_state.data_uploaded:
         st.info("👈 Upload data first.")
@@ -565,7 +680,6 @@ with tab3:
         X_test_df = st.session_state.trained_X_test.copy()
         y_test_arr = st.session_state.trained_y_test
 
-        # Performance summary
         st.subheader("📊 Performance Summary")
         p1, p2, p3 = st.columns(3)
         with p1:
@@ -575,7 +689,7 @@ with tab3:
         with p3:
             st.metric("Features", len(st.session_state.trained_feature_cols))
 
-        st.subheader("📋 Classification Report")
+        st.subheader("📋 Detailed Performance Report")
         try:
             report = classification_report(y_test_arr, test_results["y_pred"], output_dict=True, target_names=class_names)
             report_df = pd.DataFrame(report).transpose().round(3)
@@ -586,7 +700,7 @@ with tab3:
                 report_df = pd.DataFrame(report).transpose().round(3)
                 st.dataframe(report_df, use_container_width=True)
             except Exception:
-                st.info("Classification report not available for this model/problem type.")
+                st.info("Classification report not available.")
 
         # Auto-select index
         if st.session_state.explainer_selected_index is None:
@@ -605,7 +719,7 @@ with tab3:
             with sel_col:
                 st.markdown("### Selected index")
                 st.write(f"**{idx}**")
-                st.markdown("**Guidance:** Pick an index to view local explanation & model prediction details.")
+                st.markdown("**Guidance:** Pick an index to view local explanation & prediction breakdown.")
             with pred_col:
                 st.markdown("### Prediction")
                 try:
@@ -642,12 +756,11 @@ with tab3:
 
             st.markdown("---")
 
-            # If ExplainerDashboard is available: embed it and skip duplicate SHAP visuals
+            # Try using ExplainerDashboard, but gracefully fallback if it raises (e.g., Plotly titlefont error)
             if EXPLAINERDASH_AVAILABLE:
-                st.markdown("### Full ExplainerDashboard (embedded)")
-                st.markdown("Use the dashboard below for in-depth SHAP visuals, dependence plots, what-if analysis, and model diagnostics.")
+                st.markdown("### Full ExplainerDashboard (attempting to embed)")
+                st.markdown("If the dashboard cannot initialize due to environment/Plotly incompatibilities, the app will show equivalent fallback visuals below.")
                 try:
-                    # sample dataset for dashboard
                     sample_n = min(1000, len(X_test_df))
                     sample_idx = np.random.choice(len(X_test_df), size=sample_n, replace=False)
                     X_dash = X_test_df.iloc[sample_idx]
@@ -672,7 +785,7 @@ with tab3:
                         fluid=True,
                     )
 
-                    # produce HTML and patch it for Plotly property mismatches (titlefont)
+                    # If it constructs, get HTML
                     try:
                         html_str = dashboard.to_html()
                     except TypeError:
@@ -681,121 +794,21 @@ with tab3:
                             dashboard.to_html(filename=str(html_path))
                             html_str = html_path.read_text(encoding="utf-8")
 
-                    patched = patch_plotly_titlefont_in_html(html_str)
+                    # small patch for older/newer mismatches (best-effort)
+                    patched = html_str.replace("titlefont", "title_font")
+                    patched = patched.replace("title : {", "title: {")  # no-op harmless
                     components.html(patched, height=900, scrolling=True)
                 except Exception as e:
                     st.error(f"ExplainerDashboard failed to build or render: {e}")
-                    st.info("The panels above still provide predictions, contributions, and PDP information.")
-                    st.text(traceback.format_exc())
-
+                    st.info("Showing fallback explainer visuals instead.")
+                    # show fallback visuals that replicate dashboard analyses
+                    fallback_explainer_visuals(clf_pipeline, X_test_df, y_test_arr, le_target, class_names, idx)
             else:
-                # Dashboard not available — show contributions & compact SHAP visuals here
-                st.markdown("### Contributions (SHAP-style)")
-                st.markdown("SHAP visuals shown below; if SHAP isn't supported for your model type a difference-from-mean proxy will be shown.")
-                try:
-                    try:
-                        preprocessor = clf_pipeline.named_steps.get("preprocessor", None)
-                        fitted_clf = clf_pipeline.named_steps.get("classifier", clf_pipeline)
-                    except Exception:
-                        preprocessor = None
-                        fitted_clf = clf_pipeline
-
-                    bg_rows = X_test_df.sample(min(len(X_test_df), 200), replace=False)
-                    try:
-                        if preprocessor is not None:
-                            bg_trans = preprocessor.transform(bg_rows)
-                        else:
-                            bg_trans = bg_rows.values
-                    except Exception:
-                        bg_trans = bg_rows.values
-
-                    try:
-                        if preprocessor is not None and hasattr(preprocessor, "get_feature_names_out"):
-                            feat_names = preprocessor.get_feature_names_out()
-                        else:
-                            feat_names = X_test_df.columns.tolist()
-                    except Exception:
-                        feat_names = X_test_df.columns.tolist()
-
-                    shap_vals_vector = None
-                    shap_explainer = safe_shap_explainer(fitted_clf, bg_trans, feature_names=feat_names)
-                    if shap_explainer is not None:
-                        try:
-                            if preprocessor is not None:
-                                single_proc = preprocessor.transform(X_test_df.iloc[[idx]])
-                            else:
-                                single_proc = X_test_df.iloc[[idx]].values
-                        except Exception:
-                            single_proc = X_test_df.iloc[[idx]].values
-                        try:
-                            shap_out = shap_explainer(single_proc)
-                            shap_vals_vector = ensure_shap_array_for_idx(shap_out, 0)
-                        except Exception:
-                            shap_vals_vector = None
-
-                    # Try TreeExplainer fallback
-                    if shap_vals_vector is None and SHAP_AVAILABLE:
-                        try:
-                            tree_expl = shap.TreeExplainer(fitted_clf)
-                            shap_vals_raw = tree_expl.shap_values(X_test_df if preprocessor is None else preprocessor.transform(X_test_df))
-                            shap_vals_vector = ensure_shap_array_for_idx(shap_vals_raw, idx)
-                        except Exception:
-                            shap_vals_vector = None
-
-                    if shap_vals_vector is None or not SHAP_AVAILABLE:
-                        st.info("SHAP not available — showing difference-from-mean as proxy.")
-                        base = X_test_df.mean()
-                        diff = X_test_df.iloc[idx] - base
-                        contrib_df = pd.DataFrame({"feature": X_test_df.columns.tolist(), "contribution": diff.values})
-                    else:
-                        contrib = np.asarray(shap_vals_vector).ravel()
-                        if len(contrib) == len(feat_names):
-                            feat_list = list(feat_names)
-                        elif len(contrib) == len(X_test_df.columns):
-                            feat_list = list(X_test_df.columns)
-                        else:
-                            feat_list = list(X_test_df.columns)
-                            if len(contrib) > len(feat_list):
-                                contrib = contrib[: len(feat_list)]
-                            else:
-                                pad_len = len(feat_list) - len(contrib)
-                                contrib = np.concatenate([contrib, np.zeros(pad_len)])
-                        contrib_df = pd.DataFrame({"feature": feat_list, "contribution": contrib})
-
-                    contrib_df["abs_contribution"] = contrib_df["contribution"].abs()
-                    contrib_df = contrib_df.sort_values("abs_contribution", ascending=False).reset_index(drop=True)
-
-                    st.write("Top contributions (absolute impact)")
-                    st.dataframe(contrib_df[["feature", "contribution"]].head(20), use_container_width=True)
-
-                    # compact bar plot of top 10 contributions
-                    topn = min(10, len(contrib_df))
-                    fig, ax = plt.subplots(figsize=(5, 3))
-                    ax.barh(contrib_df.head(topn)["feature"][::-1], contrib_df.head(topn)["contribution"][::-1])
-                    ax.set_xlabel("Contribution (signed)", fontsize=10)
-                    ax.set_ylabel("Feature", fontsize=10)
-                    ax.tick_params(axis="x", labelsize=9)
-                    ax.tick_params(axis="y", labelsize=9)
-                    plt.tight_layout()
-                    st.pyplot(fig)
-
-                    # global compact SHAP summary (if shap_explainer exists)
-                    if SHAP_AVAILABLE and shap_explainer is not None:
-                        try:
-                            X_for_shap = X_test_df.head(200)
-                            shap_vals = shap_explainer(X_for_shap)
-                            shap_vals_for_plot = shap_vals.values if hasattr(shap_vals, "values") else shap_vals
-                            fig2 = compact_shap_summary_plot(shap_vals_for_plot, X_for_shap)
-                            st.pyplot(fig2)
-                        except Exception:
-                            pass
-
-                except Exception as e:
-                    st.error(f"Contributions failed: {e}")
-                    st.text(traceback.format_exc())
+                # not available: show fallback visuals
+                st.markdown("ExplainerDashboard not installed — showing fallback visuals.")
+                fallback_explainer_visuals(clf_pipeline, X_test_df, y_test_arr, le_target, class_names, idx)
 
             st.markdown("---")
-
             # Partial Dependence Plot (approx)
             st.markdown("### Partial Dependence Plot (approx)")
             try:
@@ -881,7 +894,6 @@ with tab4:
                                 st.success(f"Predicted {len(results)} rows.")
                                 st.dataframe(results, use_container_width=True)
 
-                                # safe filename
                                 base = safe_filename_from_upload(new_file.name)
                                 fname = f"predictions_{base}.csv"
                                 csv_buf = io.StringIO()
