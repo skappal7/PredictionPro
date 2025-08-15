@@ -12,6 +12,5 @@ seaborn
 openpyxl
 xlsxwriter
 pathlib2
-tempfile3
 joblib
 plotly
