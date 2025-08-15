@@ -615,7 +615,7 @@ with tab3:
                 with col1:
                     st.pyplot(fig_fi)
                 with col2:
-                    st.markdown("**Plain language:**")
+                    st.markdown("**What does this mean?**")
                     st.write("Features at the top influence the model the most. Higher bars mean the model uses that column more when making decisions.")
                     st.write("If a surprising feature is important, consider checking data leakage or correlations.")
             else:
