@@ -234,7 +234,7 @@ tab1, tab2, tab3, tab4 = st.tabs(["📊 Data Profiling", "🚀 Model Development
 # TAB 1: DATA PROFILING
 # -------------------------
 with tab1:
-    st.header("📊 Data Profiling (HTML-embedded)")
+    st.header("📊 Data Profiling") 
     st.markdown("Generate a profiling report and embed it here.")
     if not st.session_state.data_uploaded:
         st.info("👈 Upload a dataset in the sidebar to begin profiling.")
