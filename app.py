@@ -64,8 +64,8 @@ except Exception:
 
 # Page config
 st.set_page_config(page_title="Predictive Analytics (No ExplainerDashboard)", layout="wide", page_icon="📊")
-st.title("📊 Predictive Analytics — Fallback Visual Explainers")
-st.markdown("We removed the ExplainerDashboard and replaced it with clear, friendly charts and explanations.")
+st.title("📊 Predictive Analytics Wizard")
+st.markdown("Predictive modeling simplified: build the models, predict the outcomes and explain the results")
 
 # Session defaults
 _defaults = {
