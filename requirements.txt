@@ -12,3 +12,4 @@ openpyxl
 streamlit-pandas-profiling
 dash-bootstrap-components<2.0.0
 dash==2.17.1  # match a stable version compatible with above
+pyarrow
