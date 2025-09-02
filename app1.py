@@ -1014,3 +1014,123 @@ with st.sidebar:
     if ProfileReport is None:
         st.warning("📊 **For data profiling:**")
         st.code("pip install ydata-profiling", language="bash")
+
+# ====== OPTIMIZED HELPERS ADDED ======
+
+import psutil  # NEW: system resource check
+
+def get_system_memory_mb():
+    try:
+        return psutil.virtual_memory().available / (1024 * 1024)
+    except Exception:
+        return None
+
+def get_file_size_mb(file_obj):
+    try:
+        current_pos = file_obj.tell()
+        file_obj.seek(0, 2)
+        size = file_obj.tell()
+        file_obj.seek(current_pos)
+        return size / (1024 * 1024)
+    except:
+        return 0
+
+# -------------------------
+# Optimized CSV → Parquet
+# -------------------------
+def convert_csv_to_parquet(uploaded_file, chunk_size=50000):
+    if not PARQUET_AVAILABLE:
+        st.error("PyArrow is required for Parquet conversion. Please install: pip install pyarrow")
+        return None, None
+    try:
+        original_size = get_file_size_mb(uploaded_file)
+        temp_dir = tempfile.mkdtemp()
+        parquet_path = os.path.join(temp_dir, f"{safe_filename_base(uploaded_file.name)}.parquet")
+
+        uploaded_file.seek(0)
+        total_rows = 0
+        uploaded_file.seek(0)
+        total_lines = sum(1 for _ in uploaded_file) - 1
+        uploaded_file.seek(0)
+
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        writer = None
+
+        with st.spinner("Converting CSV to Parquet format..."):
+            chunk_count = 0
+            for chunk_df in pd.read_csv(uploaded_file, chunksize=chunk_size):
+                chunk_count += 1
+                total_rows += len(chunk_df)
+                table = pa.Table.from_pandas(chunk_df, preserve_index=False)
+                if writer is None:
+                    writer = pq.ParquetWriter(parquet_path, table.schema)
+                writer.write_table(table)
+                progress = min(total_rows / total_lines, 1.0) if total_lines > 0 else 1.0
+                progress_bar.progress(progress)
+                status_text.text(f"Processing chunk {chunk_count}: {total_rows:,} rows")
+            if writer is not None:
+                writer.close()
+
+        progress_bar.progress(1.0)
+        status_text.text(f"✅ Conversion complete! Processed {total_rows:,} rows")
+        parquet_size = os.path.getsize(parquet_path) / (1024 * 1024)
+        return parquet_path, {"original_size": original_size, "parquet_size": parquet_size, "rows": total_rows}
+    except Exception as e:
+        st.error(f"Failed to convert CSV to Parquet: {e}")
+        return None, None
+
+# -------------------------
+# Optimized profiling
+# -------------------------
+def generate_profile_html_file(df: pd.DataFrame, tmp_dir: Optional[str] = None) -> str:
+    if ProfileReport is None:
+        out_html = "<h3>Profiling library not installed</h3>"
+        fd = tempfile.NamedTemporaryFile(delete=False, suffix=".html", dir=tmp_dir)
+        fd.write(out_html.encode("utf-8"))
+        fd.close()
+        return fd.name
+    use_light = df.shape[0] > 50000 or df.shape[1] > 50
+    profile = ProfileReport(
+        df,
+        title="Dataset Profiling Report",
+        explorative=True,
+        minimal=use_light,
+        correlations={"pearson": {"calculate": not use_light}},
+    )
+    fd = tempfile.NamedTemporaryFile(delete=False, suffix=".html", dir=tmp_dir)
+    fd_path = fd.name
+    fd.close()
+    try:
+        profile.to_file(fd_path)
+        return fd_path
+    except Exception:
+        html_str = profile.to_html()
+        with open(fd_path, "w", encoding="utf-8") as fh:
+            fh.write(html_str)
+        return fd_path
+
+# -------------------------
+# Optimized prediction batching
+# -------------------------
+def predict_in_batches(clf_pipeline, features_df, batch_size=10000):
+    preds = []
+    prob_list = []
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    for i in range(0, len(features_df), batch_size):
+        batch = features_df.iloc[i:i+batch_size]
+        progress = min((i + len(batch)) / len(features_df), 1.0)
+        progress_bar.progress(progress)
+        status_text.text(f"Processing batch: {i+1:,} → {min(i+batch_size, len(features_df)):,}")
+        batch_preds = clf_pipeline.predict(batch)
+        preds.extend(batch_preds)
+        try:
+            batch_probs = clf_pipeline.predict_proba(batch)
+            prob_list.append(batch_probs)
+        except Exception:
+            pass
+    progress_bar.progress(1.0)
+    status_text.text("✅ Prediction complete!")
+    probs = np.concatenate(prob_list, axis=0) if prob_list else None
+    return np.array(preds), probs
