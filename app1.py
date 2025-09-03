@@ -996,7 +996,7 @@ with tab4:
 
 # Footer
 st.markdown("---")
-st.markdown("Built with ❤️ using Streamlit | CE Innovation Team © 2025")
+st.markdown("Built with ❤️ using Streamlit | CE Innovation Labs © 2025")
 
 # NEW: Add installation instructions in sidebar
 with st.sidebar:
