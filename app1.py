@@ -72,7 +72,7 @@ except Exception:
     HAS_ST_PROFILE = False
 
 # Page config
-st.set_page_config(page_title="Predictive Analytics (No ExplainerDashboard)", layout="wide", page_icon="📊")
+st.set_page_config(page_title="Predictive Analytics", layout="wide", page_icon="📊")
 st.title("📊 Predictive Analytics Wizard")
 st.markdown("Predictive modeling simplified: build the models, predict the outcomes and explain the results")
 
@@ -562,8 +562,8 @@ with tab2:
 # TAB 3: MODEL EVALUATION & FALLBACK VISUAL EXPLAINER
 # -------------------------
 with tab3:
-    st.header("🔍 Model Evaluation & Visual Explain (fallback)")
-    st.markdown("ExplainerDashboard removed. Below are polished visual diagnostics and plain-language commentary to help anyone understand model behavior.")
+    st.header("🔍 Model Evaluation & Visual Explainer")
+    st.markdown("Model evaluation diagnostics to understand model behavior and key variables impacting the target variable.")
 
     if not st.session_state.data_uploaded:
         st.info("👈 Upload data first.")
