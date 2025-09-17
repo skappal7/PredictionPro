@@ -1891,7 +1891,7 @@ with tab4:
     else:
         model = st.session_state.get('trained_model')
         feature_cols = st.session_state.get('trained_feature_columns')
-        le_target = st.session_state.get('trained_le_target'
+        le_target = st.session_state.get('trained_le_target')
         problem_type = st.session_state.get('trained_problem_type')
         training_data = st.session_state.get('training_data')
         
