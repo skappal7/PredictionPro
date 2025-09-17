@@ -57,6 +57,12 @@ try:
 except ImportError:
     PARQUET_AVAILABLE = False
 
+try:
+    import cloudpickle
+    CLOUDPICKLE_AVAILABLE = True
+except ImportError:
+    CLOUDPICKLE_AVAILABLE = False
+
 # Core ML libraries
 from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.preprocessing import LabelEncoder, OneHotEncoder, StandardScaler
@@ -203,30 +209,187 @@ def load_and_process_data(uploaded_file) -> Tuple[pd.DataFrame, str]:
         return None, None
 
 @st.cache_data
+def safe_data_cleaning(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Robust data cleaning that never fails:
+    - Coerces all numeric columns with pd.to_numeric(errors='coerce')
+    - Fills missing values with column means, fallback to 0
+    - Handles categorical columns safely
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+    
+    try:
+        df_clean = df.copy()
+        
+        # Remove completely empty columns
+        df_clean = df_clean.dropna(axis=1, how='all')
+        
+        if df_clean.empty:
+            return pd.DataFrame()
+        
+        # Process each column safely
+        for col in df_clean.columns:
+            try:
+                # Try to convert to numeric first
+                numeric_series = pd.to_numeric(df_clean[col], errors='coerce')
+                
+                # If more than 30% of values are numeric after conversion, treat as numeric
+                non_null_numeric = numeric_series.dropna()
+                if len(non_null_numeric) >= 0.3 * len(df_clean[col].dropna()):
+                    df_clean[col] = numeric_series
+                    # Fill missing values with mean, fallback to 0
+                    col_mean = df_clean[col].mean()
+                    fill_value = col_mean if not pd.isna(col_mean) else 0
+                    df_clean[col] = df_clean[col].fillna(fill_value)
+                else:
+                    # Handle as categorical - fill missing with mode or 'Unknown'
+                    if df_clean[col].dtype == 'object':
+                        mode_val = df_clean[col].mode()
+                        fill_value = mode_val.iloc[0] if not mode_val.empty else 'Unknown'
+                        df_clean[col] = df_clean[col].fillna(fill_value).astype(str)
+            
+            except Exception:
+                # Last resort: convert to string and fill missing
+                df_clean[col] = df_clean[col].astype(str).fillna('Unknown')
+        
+        # Remove any remaining problematic columns
+        problematic_cols = []
+        for col in df_clean.columns:
+            try:
+                # Test if column can be processed
+                _ = df_clean[col].dtype
+                _ = df_clean[col].isnull().sum()
+                _ = df_clean[col].nunique()
+            except Exception:
+                problematic_cols.append(col)
+        
+        if problematic_cols:
+            df_clean = df_clean.drop(columns=problematic_cols)
+        
+        # Final safety check - ensure no infinite values
+        numeric_cols = df_clean.select_dtypes(include=[np.number]).columns
+        for col in numeric_cols:
+            df_clean[col] = df_clean[col].replace([np.inf, -np.inf], np.nan)
+            df_clean[col] = df_clean[col].fillna(0)
+        
+        return df_clean
+        
+    except Exception as e:
+        st.warning(f"Data cleaning encountered issues: {e}. Using minimal cleaning.")
+        # Absolute fallback - return first few columns as strings
+        try:
+            simple_df = df.iloc[:, :min(5, df.shape[1])].copy()
+            for col in simple_df.columns:
+                simple_df[col] = simple_df[col].astype(str).fillna('Unknown')
+            return simple_df
+        except Exception:
+            return pd.DataFrame({'default_col': ['No data available']})
+
+@st.cache_data
 def generate_profile_report(_df: pd.DataFrame, minimal: bool = False) -> str:
-    """Generate profiling report with caching"""
-    if ProfileReport is None:
-        return "<h3>Profiling library not available</h3>"
+    """Generate profiling report with bulletproof error handling"""
+    try:
+        if ProfileReport is None:
+            return "<h3>Profiling library not available</h3><p>Install ydata-profiling: <code>pip install ydata-profiling</code></p>"
+        
+        if _df is None or _df.empty:
+            return "<h3>No data available for profiling</h3>"
+        
+        # Clean data safely
+        df_clean = safe_data_cleaning(_df)
+        
+        if df_clean.empty:
+            return "<h3>Data could not be processed for profiling</h3>"
+        
+        # Limit data size for performance
+        if len(df_clean) > 10000 and not minimal:
+            df_clean = df_clean.sample(n=10000, random_state=42)
+            sample_note = f"<p><em>Note: Profiled on random sample of 10,000 rows from {len(_df):,} total rows.</em></p>"
+        else:
+            sample_note = ""
+        
+        # Configure profile settings for safety
+        profile_config = {
+            "title": "Dataset Profile",
+            "minimal": minimal,
+            "explorative": not minimal,
+            "lazy": False,
+            "vars": {
+                "num": {"low_categorical_threshold": 0},
+            },
+            "correlations": {
+                "auto": {"calculate": not minimal},
+                "pearson": {"calculate": not minimal},
+                "spearman": {"calculate": False},  # Often causes issues
+                "kendall": {"calculate": False},   # Often causes issues
+                "phi_k": {"calculate": False},     # Often causes issues
+                "cramers": {"calculate": False},   # Often causes issues
+            },
+            "interactions": {"continuous": False},  # Disable interactions to prevent crashes
+            "missing_diagrams": {"bar": not minimal, "matrix": False, "heatmap": False}
+        }
+        
+        profile = ProfileReport(df_clean, **profile_config)
+        
+        # Try to generate HTML
+        try:
+            html_str = profile.to_html()
+            return sample_note + html_str
+        except Exception as e:
+            # Fallback to minimal profile
+            try:
+                minimal_config = profile_config.copy()
+                minimal_config["minimal"] = True
+                minimal_config["explorative"] = False
+                minimal_config["correlations"] = {"auto": {"calculate": False}}
+                
+                minimal_profile = ProfileReport(df_clean, **minimal_config)
+                html_str = minimal_profile.to_html()
+                return f"<p><em>Generated minimal profile due to processing constraints.</em></p>{sample_note}{html_str}"
+            except Exception:
+                # Ultimate fallback - basic HTML summary
+                return generate_basic_profile_html(df_clean)
     
-    # Create sanitized copy
-    df_clean = _df.copy()
-    df_clean = df_clean.select_dtypes(exclude=['object']).fillna(df_clean.mean())
-    
-    profile = ProfileReport(
-        df_clean,
-        title="Dataset Profile",
-        minimal=minimal,
-        explorative=not minimal
-    )
-    
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".html")
-    profile.to_file(temp_file.name)
-    
-    with open(temp_file.name, 'r', encoding='utf-8') as f:
-        html_content = f.read()
-    
-    os.unlink(temp_file.name)
-    return html_content
+    except Exception as e:
+        st.warning(f"Profile generation failed: {e}")
+        return generate_basic_profile_html(_df if _df is not None else pd.DataFrame())
+
+def generate_basic_profile_html(df: pd.DataFrame) -> str:
+    """Generate a basic HTML profile when all else fails"""
+    try:
+        if df.empty:
+            return "<h3>No data available</h3>"
+        
+        html = "<h3>Basic Data Profile</h3>"
+        html += f"<p><strong>Shape:</strong> {df.shape[0]:,} rows × {df.shape[1]} columns</p>"
+        
+        # Basic statistics
+        html += "<h4>Column Summary</h4><table border='1'>"
+        html += "<tr><th>Column</th><th>Type</th><th>Missing</th><th>Unique Values</th></tr>"
+        
+        for col in df.columns[:20]:  # Limit to first 20 columns
+            try:
+                col_type = str(df[col].dtype)
+                missing_count = df[col].isnull().sum()
+                unique_count = df[col].nunique()
+                html += f"<tr><td>{col}</td><td>{col_type}</td><td>{missing_count}</td><td>{unique_count}</td></tr>"
+            except Exception:
+                html += f"<tr><td>{col}</td><td>Error</td><td>-</td><td>-</td></tr>"
+        
+        html += "</table>"
+        
+        # Memory usage
+        try:
+            memory_mb = df.memory_usage(deep=True).sum() / 1024**2
+            html += f"<p><strong>Memory Usage:</strong> {memory_mb:.1f} MB</p>"
+        except Exception:
+            pass
+        
+        return html
+        
+    except Exception:
+        return "<h3>Profile generation failed</h3><p>Unable to generate even basic profile.</p>"
 
 def safe_onehot_encoder():
     """Create OneHotEncoder compatible with different sklearn versions"""
@@ -366,22 +529,111 @@ def create_shap_plots(shap_values, feature_names, X_sample):
     
     return fig_summary, fig_waterfall
 
-# Model download functionality
+# Model download functionality with robust serialization
 def create_model_download_package(model, feature_cols, le_target, model_name, metrics):
-    """Create downloadable model package"""
-    model_package = {
-        'model': model,
+    """Create downloadable model package with bulletproof serialization"""
+    try:
+        # Create model package with safe serialization
+        model_package = {
+            'model': model,
+            'feature_columns': feature_cols,
+            'label_encoder': le_target,
+            'model_name': model_name,
+            'metrics': metrics,
+            'timestamp': pd.Timestamp.now().isoformat(),
+            'version': '2.0'
+        }
+        
+        # Try serialization with different methods
+        buffer = io.BytesIO()
+        
+        # Method 1: Try cloudpickle if available (best for complex objects)
+        if CLOUDPICKLE_AVAILABLE:
+            try:
+                joblib.dump(model_package, buffer, pickle_module=cloudpickle)
+                buffer.seek(0)
+                return buffer.getvalue()
+            except Exception as e:
+                st.warning(f"Cloudpickle serialization failed: {e}. Trying fallback methods.")
+                buffer = io.BytesIO()  # Reset buffer
+        
+        # Method 2: Try standard joblib
+        try:
+            joblib.dump(model_package, buffer)
+            buffer.seek(0)
+            return buffer.getvalue()
+        except Exception as e:
+            st.warning(f"Standard joblib serialization failed: {e}. Trying safe mode.")
+            buffer = io.BytesIO()  # Reset buffer
+        
+        # Method 3: Safe serialization - remove unpicklable items
+        safe_package = create_safe_model_package(model, feature_cols, le_target, model_name, metrics)
+        
+        if CLOUDPICKLE_AVAILABLE:
+            joblib.dump(safe_package, buffer, pickle_module=cloudpickle)
+        else:
+            joblib.dump(safe_package, buffer)
+        
+        buffer.seek(0)
+        return buffer.getvalue()
+        
+    except Exception as e:
+        st.error(f"All serialization methods failed: {e}")
+        # Return minimal package as last resort
+        return create_minimal_model_package(model_name, metrics)
+
+def create_safe_model_package(model, feature_cols, le_target, model_name, metrics):
+    """Create a model package by removing unpicklable components"""
+    safe_package = {
+        'model_name': model_name,
         'feature_columns': feature_cols,
-        'label_encoder': le_target,
+        'metrics': metrics,
+        'timestamp': pd.Timestamp.now().isoformat(),
+        'version': '2.0_safe'
+    }
+    
+    # Try to include model
+    try:
+        # Test if model can be pickled
+        test_buffer = io.BytesIO()
+        joblib.dump(model, test_buffer)
+        safe_package['model'] = model
+    except Exception:
+        st.warning("Model object could not be serialized. Saving model parameters instead.")
+        safe_package['model_info'] = {
+            'type': str(type(model)),
+            'parameters': getattr(model, 'get_params', lambda: {})()
+        }
+    
+    # Try to include label encoder
+    try:
+        if le_target is not None:
+            test_buffer = io.BytesIO()
+            joblib.dump(le_target, test_buffer)
+            safe_package['label_encoder'] = le_target
+        else:
+            safe_package['label_encoder'] = None
+    except Exception:
+        st.warning("Label encoder could not be serialized. Saving classes instead.")
+        if le_target is not None and hasattr(le_target, 'classes_'):
+            safe_package['label_encoder_classes'] = le_target.classes_.tolist()
+        else:
+            safe_package['label_encoder_classes'] = None
+    
+    return safe_package
+
+def create_minimal_model_package(model_name, metrics):
+    """Create minimal package when all else fails"""
+    minimal_info = {
         'model_name': model_name,
         'metrics': metrics,
         'timestamp': pd.Timestamp.now().isoformat(),
-        'version': '1.0'
+        'version': '2.0_minimal',
+        'note': 'This is a minimal package due to serialization constraints. The trained model could not be included.'
     }
     
-    # Serialize model
     buffer = io.BytesIO()
-    joblib.dump(model_package, buffer)
+    joblib.dump(minimal_info, buffer)
     buffer.seek(0)
     return buffer.getvalue()
 
@@ -522,13 +774,24 @@ with tabs[0]:
         with profile_options[1]:
             if st.button("Generate Profile Report", type="primary"):
                 with st.spinner("Generating profile report..."):
-                    minimal = (profile_type == "Quick")
-                    html_content = generate_profile_report(df, minimal=minimal)
-                    st.session_state.profile_html = html_content
-                    st.session_state.profile_generated = True
+                    try:
+                        minimal = (profile_type == "Quick")
+                        html_content = generate_profile_report(df, minimal=minimal)
+                        st.session_state.profile_html = html_content
+                        st.session_state.profile_generated = True
+                        st.success("Profile report generated successfully!")
+                    except Exception as e:
+                        st.error(f"Profile generation failed: {e}")
+                        # Generate basic fallback
+                        st.session_state.profile_html = generate_basic_profile_html(df)
+                        st.session_state.profile_generated = True
         
         if st.session_state.get('profile_generated', False):
-            components.html(st.session_state.profile_html, height=800, scrolling=True)
+            try:
+                components.html(st.session_state.profile_html, height=800, scrolling=True)
+            except Exception as e:
+                st.error(f"Failed to display profile: {e}")
+                st.text("Profile HTML could not be rendered.")
 
 # Tab 2: Model Lab
 with tabs[1]:
@@ -1308,18 +1571,29 @@ with footer_col3:
 
 # Installation helper in sidebar
 with st.sidebar:
-    if not all([SHAP_AVAILABLE, OPTUNA_AVAILABLE, MLFLOW_AVAILABLE]):
+    missing_libs = []
+    if not SHAP_AVAILABLE: missing_libs.append("shap")
+    if not OPTUNA_AVAILABLE: missing_libs.append("optuna") 
+    if not MLFLOW_AVAILABLE: missing_libs.append("mlflow")
+    if not CLOUDPICKLE_AVAILABLE: missing_libs.append("cloudpickle")
+    
+    if missing_libs:
         st.markdown("---")
         st.markdown("### 🚀 Enhance Your Experience")
+        st.markdown("Install additional libraries for full functionality:")
         
         if not SHAP_AVAILABLE:
             st.code("pip install shap", language="bash")
-            st.caption("For advanced model explanations")
+            st.caption("📊 Advanced model explanations")
         
         if not OPTUNA_AVAILABLE:
-            st.code("pip install optuna", language="bash")
-            st.caption("For hyperparameter optimization")
+            st.code("pip install optuna", language="bash") 
+            st.caption("🔍 Hyperparameter optimization")
         
         if not MLFLOW_AVAILABLE:
             st.code("pip install mlflow", language="bash")
-            st.caption("For experiment tracking")
+            st.caption("📈 Experiment tracking")
+            
+        if not CLOUDPICKLE_AVAILABLE:
+            st.code("pip install cloudpickle", language="bash")
+            st.caption("🔧 Better model serialization")
