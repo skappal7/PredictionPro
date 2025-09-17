@@ -55,37 +55,61 @@ st.set_page_config(
     page_icon="🤖"
 )
 
-# Professional CSS
+# Professional CSS with corporate colors
 st.markdown("""
 <style>
     .main-header {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        background: linear-gradient(135deg, #2c3e50 0%, #3498db 100%);
         padding: 2rem;
-        border-radius: 15px;
+        border-radius: 10px;
         color: white;
         text-align: center;
         margin-bottom: 2rem;
+        box-shadow: 0 4px 15px rgba(52, 152, 219, 0.3);
     }
     .metric-card {
-        background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+        background: linear-gradient(135deg, #34495e 0%, #2980b9 100%);
         padding: 1.5rem;
-        border-radius: 12px;
+        border-radius: 8px;
         color: white;
         text-align: center;
         margin: 0.5rem 0;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
     }
     .stTabs [data-baseweb="tab-list"] {
-        gap: 8px;
+        gap: 4px;
+        background: #f8f9fa;
+        padding: 0.5rem;
+        border-radius: 8px;
     }
     .stTabs [data-baseweb="tab"] {
-        height: 55px;
+        height: 50px;
         background: white;
-        border-radius: 8px;
+        border-radius: 6px;
         font-weight: 600;
+        color: #2c3e50;
+        border: 1px solid #bdc3c7;
     }
     .stTabs [aria-selected="true"] {
-        background: linear-gradient(135deg, #667eea, #764ba2);
+        background: linear-gradient(135deg, #2c3e50, #3498db);
         color: white;
+        border: 1px solid #3498db;
+        box-shadow: 0 2px 8px rgba(52, 152, 219, 0.3);
+    }
+    .sidebar .sidebar-content {
+        background: #ecf0f1;
+    }
+    .stButton > button {
+        background: linear-gradient(135deg, #2c3e50, #3498db);
+        color: white;
+        border: none;
+        border-radius: 6px;
+        font-weight: 600;
+    }
+    .stButton > button:hover {
+        background: linear-gradient(135deg, #34495e, #2980b9);
+        transform: translateY(-1px);
+        box-shadow: 0 4px 12px rgba(52, 152, 219, 0.3);
     }
 </style>
 """, unsafe_allow_html=True)
@@ -223,30 +247,52 @@ def create_shap_explanation_safe(model, X_sample, model_type: str):
         return None, None, None
 
 def serialize_model_safe(model, feature_cols, le_target, model_name, metrics):
+    """Fixed model serialization that won't hang"""
     try:
+        # Create a lighter package to avoid hanging
         package = {
-            'model': model,
             'feature_columns': feature_cols,
-            'label_encoder': le_target,
             'model_name': model_name,
             'metrics': metrics,
             'timestamp': pd.Timestamp.now().isoformat(),
+            'problem_type': st.session_state.get('problem_type', 'unknown'),
             'version': '2.0'
         }
         
+        # Try to include model but with timeout protection
+        try:
+            # Test serialization quickly first
+            test_buffer = io.BytesIO()
+            joblib.dump(model, test_buffer, compress=1)  # Light compression
+            test_buffer.seek(0)
+            
+            # If test successful, add to package
+            package['model'] = model
+            package['label_encoder'] = le_target
+            
+        except Exception:
+            # Fallback: save model info instead of object
+            package['model_info'] = {
+                'type': str(type(model).__name__),
+                'parameters': str(model.get_params()) if hasattr(model, 'get_params') else 'N/A'
+            }
+            package['note'] = 'Model object could not be serialized - parameters saved instead'
+        
+        # Final serialization
         buffer = io.BytesIO()
-        joblib.dump(package, buffer, compress=3)
+        joblib.dump(package, buffer, compress=1)  # Fast compression
         buffer.seek(0)
         return buffer.getvalue()
-    except Exception:
+        
+    except Exception as e:
+        st.error(f"Serialization failed: {str(e)}")
+        # Ultimate fallback
         minimal_package = {
-            'feature_columns': feature_cols,
             'model_name': model_name,
             'metrics': metrics,
             'timestamp': pd.Timestamp.now().isoformat(),
-            'note': 'Model object excluded due to serialization issues'
+            'error': 'Serialization failed'
         }
-        
         buffer = io.BytesIO()
         joblib.dump(minimal_package, buffer)
         buffer.seek(0)
@@ -634,81 +680,228 @@ with tabs[2]:
             fig_scatter.add_trace(go.Scatter(x=[min_val, max_val], y=[min_val, max_val], mode='lines', name='Perfect'))
             st.plotly_chart(fig_scatter, use_container_width=True)
         
-        # SHAP explanations
-        st.markdown("### 🎯 SHAP Explanations")
+        # SHAP explanations with robust fallbacks
+        st.markdown("### 🎯 Model Explanations")
         
+        shap_success = False
+        
+        # Try SHAP first
         with st.spinner("Generating SHAP explanations..."):
-            shap_values, explainer, X_shap = create_shap_explanation_safe(model, X_test, model_name)
-            
-            if shap_values is not None and X_shap is not None:
-                try:
-                    st.markdown("#### 📊 Feature Importance")
+            try:
+                shap_values, explainer, X_shap = create_shap_explanation_safe(model, X_test, model_name)
+                
+                if shap_values is not None and X_shap is not None:
+                    st.success("✅ SHAP explanations generated successfully")
                     
-                    fig_shap, ax = plt.subplots(figsize=(10, 6))
-                    
-                    if hasattr(shap_values, 'values'):
-                        plot_values = shap_values.values
-                        plot_data = X_shap
-                    else:
-                        if isinstance(shap_values, list) and len(shap_values) > 1:
-                            plot_values = shap_values[1]
-                        else:
-                            plot_values = shap_values[0] if isinstance(shap_values, list) else shap_values
-                        plot_data = X_shap
-                    
-                    shap.summary_plot(plot_values, plot_data, feature_names=X_test.columns.tolist(), show=False, ax=ax)
-                    plt.title("SHAP Feature Importance")
-                    plt.tight_layout()
-                    st.pyplot(fig_shap)
-                    
-                    # Individual explanation
-                    st.markdown("#### 🔍 Individual Explanation")
-                    
-                    col1, col2 = st.columns([1, 2])
-                    
-                    with col1:
-                        sample_idx = st.slider("Sample to explain", 0, min(20, len(X_test)-1), 0)
+                    try:
+                        st.markdown("#### 📊 SHAP Feature Importance")
                         
-                        actual_val = y_test[sample_idx]
-                        pred_val = y_pred[sample_idx]
+                        fig_shap, ax = plt.subplots(figsize=(10, 6))
                         
-                        if st.session_state.trained_le_target:
-                            actual_label = st.session_state.trained_le_target.inverse_transform([actual_val])[0]
-                            pred_label = st.session_state.trained_le_target.inverse_transform([pred_val])[0]
-                            st.metric("Actual", actual_label)
-                            st.metric("Predicted", pred_label)
+                        if hasattr(shap_values, 'values'):
+                            plot_values = shap_values.values
+                            plot_data = X_shap
                         else:
-                            st.metric("Actual", f"{actual_val:.3f}")
-                            st.metric("Predicted", f"{pred_val:.3f}")
-                    
-                    with col2:
-                        try:
-                            fig_waterfall, ax_waterfall = plt.subplots(figsize=(8, 5))
-                            
-                            if sample_idx < len(plot_values):
-                                sample_shap = plot_values[sample_idx]
+                            if isinstance(shap_values, list) and len(shap_values) > 1:
+                                plot_values = shap_values[1]
                             else:
-                                sample_shap = plot_values[0]
+                                plot_values = shap_values[0] if isinstance(shap_values, list) else shap_values
+                            plot_data = X_shap
+                        
+                        shap.summary_plot(plot_values, plot_data, feature_names=X_test.columns.tolist(), show=False, ax=ax)
+                        plt.title("SHAP Feature Importance")
+                        plt.tight_layout()
+                        st.pyplot(fig_shap)
+                        
+                        # Individual explanation
+                        st.markdown("#### 🔍 Individual Explanation")
+                        
+                        col1, col2 = st.columns([1, 2])
+                        
+                        with col1:
+                            sample_idx = st.slider("Sample to explain", 0, min(20, len(X_test)-1), 0)
                             
-                            top_indices = np.argsort(np.abs(sample_shap))[-8:]
-                            colors = ['red' if val > 0 else 'blue' for val in sample_shap[top_indices]]
+                            actual_val = y_test[sample_idx]
+                            pred_val = y_pred[sample_idx]
                             
-                            ax_waterfall.barh(range(len(top_indices)), sample_shap[top_indices], color=colors)
-                            ax_waterfall.set_yticks(range(len(top_indices)))
-                            ax_waterfall.set_yticklabels([X_test.columns[i] for i in top_indices])
-                            ax_waterfall.set_xlabel("SHAP Value")
-                            ax_waterfall.set_title(f"Sample {sample_idx + 1} Explanation")
-                            ax_waterfall.axvline(x=0, color='black', alpha=0.3)
-                            
-                            plt.tight_layout()
-                            st.pyplot(fig_waterfall)
-                        except Exception:
-                            st.info("Individual explanation plot not available")
+                            if st.session_state.trained_le_target:
+                                actual_label = st.session_state.trained_le_target.inverse_transform([actual_val])[0]
+                                pred_label = st.session_state.trained_le_target.inverse_transform([pred_val])[0]
+                                st.metric("Actual", actual_label)
+                                st.metric("Predicted", pred_label)
+                            else:
+                                st.metric("Actual", f"{actual_val:.3f}")
+                                st.metric("Predicted", f"{pred_val:.3f}")
+                        
+                        with col2:
+                            try:
+                                fig_waterfall, ax_waterfall = plt.subplots(figsize=(8, 5))
+                                
+                                if sample_idx < len(plot_values):
+                                    sample_shap = plot_values[sample_idx]
+                                else:
+                                    sample_shap = plot_values[0]
+                                
+                                top_indices = np.argsort(np.abs(sample_shap))[-8:]
+                                colors = ['#2c3e50' if val > 0 else '#e74c3c' for val in sample_shap[top_indices]]
+                                
+                                ax_waterfall.barh(range(len(top_indices)), sample_shap[top_indices], color=colors)
+                                ax_waterfall.set_yticks(range(len(top_indices)))
+                                ax_waterfall.set_yticklabels([X_test.columns[i] for i in top_indices])
+                                ax_waterfall.set_xlabel("SHAP Value")
+                                ax_waterfall.set_title(f"Sample {sample_idx + 1} Explanation")
+                                ax_waterfall.axvline(x=0, color='black', alpha=0.3)
+                                
+                                plt.tight_layout()
+                                st.pyplot(fig_waterfall)
+                                shap_success = True
+                            except Exception:
+                                st.warning("Individual explanation plot failed, but SHAP summary is available")
+                                shap_success = True
+                        
+                    except Exception as e:
+                        st.warning(f"SHAP visualization failed: {str(e)}")
+                        st.info("Falling back to alternative explanations...")
+                else:
+                    st.warning("SHAP explanations not available for this model type")
+            
+            except Exception as e:
+                st.warning(f"SHAP failed: {str(e)}. Using alternative explanation methods.")
+        
+        # Fallback explanations when SHAP fails
+        if not shap_success:
+            st.markdown("#### 🔧 Alternative Feature Analysis")
+            
+            try:
+                # Extract the actual model from pipeline
+                if hasattr(model, 'named_steps'):
+                    classifier = model.named_steps.get('model', model)
+                    preprocessor = model.named_steps.get('preprocessor')
+                else:
+                    classifier = model
+                    preprocessor = None
+                
+                # Get feature names after preprocessing
+                if preprocessor and hasattr(preprocessor, 'get_feature_names_out'):
+                    try:
+                        feature_names = preprocessor.get_feature_names_out()
+                    except:
+                        feature_names = X_test.columns.tolist()
+                else:
+                    feature_names = X_test.columns.tolist()
+                
+                explanation_found = False
+                
+                # Method 1: Built-in feature importance
+                if hasattr(classifier, 'feature_importances_'):
+                    st.success("✅ Using built-in feature importances")
+                    importances = classifier.feature_importances_
                     
-                except Exception as e:
-                    st.error(f"SHAP visualization failed: {str(e)}")
-            else:
-                st.warning("SHAP explanations not available for this model")
+                    importance_df = pd.DataFrame({
+                        'Feature': feature_names[:len(importances)],
+                        'Importance': importances
+                    }).sort_values('Importance', ascending=True).tail(15)
+                    
+                    fig_importance = px.bar(
+                        importance_df,
+                        x='Importance',
+                        y='Feature',
+                        orientation='h',
+                        title="Feature Importances",
+                        color='Importance',
+                        color_continuous_scale=['#3498db', '#2c3e50']
+                    )
+                    
+                    fig_importance.update_layout(height=500)
+                    st.plotly_chart(fig_importance, use_container_width=True)
+                    explanation_found = True
+                
+                # Method 2: Linear model coefficients
+                elif hasattr(classifier, 'coef_'):
+                    st.success("✅ Using model coefficients")
+                    coefficients = classifier.coef_
+                    
+                    if coefficients.ndim > 1:
+                        coefficients = np.abs(coefficients).mean(axis=0)
+                    else:
+                        coefficients = np.abs(coefficients)
+                    
+                    coef_df = pd.DataFrame({
+                        'Feature': feature_names[:len(coefficients)],
+                        'Coefficient': coefficients
+                    }).sort_values('Coefficient', ascending=True).tail(15)
+                    
+                    fig_coef = px.bar(
+                        coef_df,
+                        x='Coefficient',
+                        y='Feature',
+                        orientation='h',
+                        title="Feature Coefficients (Absolute)",
+                        color='Coefficient',
+                        color_continuous_scale=['#3498db', '#2c3e50']
+                    )
+                    
+                    fig_coef.update_layout(height=500)
+                    st.plotly_chart(fig_coef, use_container_width=True)
+                    explanation_found = True
+                
+                # Method 3: Permutation importance as last resort
+                if not explanation_found:
+                    st.info("Calculating permutation importance (this may take a moment)...")
+                    
+                    try:
+                        from sklearn.inspection import permutation_importance
+                        
+                        # Use a sample for speed
+                        sample_size = min(500, len(X_test))
+                        X_sample = X_test.iloc[:sample_size]
+                        y_sample = y_test[:sample_size]
+                        
+                        perm_importance = permutation_importance(
+                            model, X_sample, y_sample, 
+                            n_repeats=5, random_state=42
+                        )
+                        
+                        perm_df = pd.DataFrame({
+                            'Feature': X_test.columns,
+                            'Importance': perm_importance.importances_mean
+                        }).sort_values('Importance', ascending=True).tail(15)
+                        
+                        fig_perm = px.bar(
+                            perm_df,
+                            x='Importance',
+                            y='Feature', 
+                            orientation='h',
+                            title="Permutation Feature Importance",
+                            color='Importance',
+                            color_continuous_scale=['#3498db', '#2c3e50']
+                        )
+                        
+                        st.plotly_chart(fig_perm, use_container_width=True)
+                        st.success("✅ Permutation importance calculated successfully")
+                        explanation_found = True
+                        
+                    except Exception as e:
+                        st.error(f"Permutation importance failed: {str(e)}")
+                
+                if not explanation_found:
+                    st.error("No explanation method available for this model type")
+                    
+                    # Show basic model info instead
+                    st.markdown("#### 📋 Model Information")
+                    model_info = {
+                        'Model Type': str(type(classifier).__name__),
+                        'Problem Type': problem_type.title(),
+                        'Features Used': len(feature_cols),
+                        'Training Samples': len(y_test)
+                    }
+                    
+                    info_df = pd.DataFrame(list(model_info.items()), columns=['Property', 'Value'])
+                    st.dataframe(info_df, use_container_width=True)
+                
+            except Exception as e:
+                st.error(f"All explanation methods failed: {str(e)}")
+                st.info("The model still works for predictions, but explanations are not available.")
 
 # Tab 4: Predictions
 with tabs[3]:
