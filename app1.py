@@ -708,7 +708,13 @@ with tabs[2]:
                                 plot_values = shap_values[0] if isinstance(shap_values, list) else shap_values
                             plot_data = X_shap
                         
-                        shap.summary_plot(plot_values, plot_data, feature_names=X_test.columns.tolist(), show=False, ax=ax)
+                        # SHAP plot with proper API for version 0.46.0
+                        shap.summary_plot(
+                            plot_values, 
+                            plot_data,
+                            feature_names=X_test.columns.tolist(),
+                            show=False
+                        )
                         plt.title("SHAP Feature Importance")
                         plt.tight_layout()
                         st.pyplot(fig_shap)
