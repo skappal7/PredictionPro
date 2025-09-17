@@ -1,10 +1,11 @@
-# app.py
 """
-Predictive Analytics Streamlit App — NO ExplainerDashboard
-- Full app: upload -> profile -> train -> evaluate -> predict
-- ExplainerDashboard removed; replaced with polished fallback visuals + plain-language commentary
-- Charts are compact and arranged with commentary next to each chart
-- NEW: Added heavy CSV to Parquet conversion for faster processing
+Enhanced Predictive Analytics AutoML App
+- Professional UI/UX with production-grade features
+- Advanced model explainability with SHAP integration
+- Hyperparameter optimization with Optuna
+- Model downloading capabilities
+- MLflow experiment tracking
+- Optimized caching and performance
 """
 
 import io
@@ -12,19 +13,43 @@ import os
 import re
 import tempfile
 import traceback
-import random
+import pickle
+import joblib
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any, Tuple
+import hashlib
+import uuid
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import seaborn as sns
 import numpy as np
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-# NEW: Import for Parquet support
+# Enhanced dependencies
+try:
+    import shap
+    SHAP_AVAILABLE = True
+except ImportError:
+    SHAP_AVAILABLE = False
+
+try:
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    OPTUNA_AVAILABLE = True
+except ImportError:
+    OPTUNA_AVAILABLE = False
+
+try:
+    import mlflow
+    import mlflow.sklearn
+    MLFLOW_AVAILABLE = True
+except ImportError:
+    MLFLOW_AVAILABLE = False
+
 try:
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -32,8 +57,8 @@ try:
 except ImportError:
     PARQUET_AVAILABLE = False
 
-# sklearn / imbalanced-learn
-from sklearn.model_selection import train_test_split
+# Core ML libraries
+from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.preprocessing import LabelEncoder, OneHotEncoder, StandardScaler
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
@@ -41,1096 +66,1260 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.svm import SVC
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.metrics import accuracy_score, confusion_matrix, classification_report, roc_curve, auc, precision_recall_curve
+from sklearn.metrics import (accuracy_score, confusion_matrix, classification_report, 
+                           roc_curve, auc, precision_recall_curve, f1_score)
 
 try:
     from imblearn.pipeline import Pipeline as ImbPipeline
     from imblearn.over_sampling import SMOTE, RandomOverSampler
     from imblearn.under_sampling import RandomUnderSampler
     IMB_AVAILABLE = True
-except Exception:
+except ImportError:
     ImbPipeline = Pipeline
     SMOTE = RandomOverSampler = RandomUnderSampler = None
     IMB_AVAILABLE = False
 
-# Optional profiling
 try:
     from ydata_profiling import ProfileReport
     PROFILING_LIB = "ydata_profiling"
-except Exception:
+except ImportError:
     try:
         from pandas_profiling import ProfileReport
         PROFILING_LIB = "pandas_profiling"
-    except Exception:
+    except ImportError:
         ProfileReport = None
         PROFILING_LIB = None
 
-try:
-    from streamlit_pandas_profiling import st_profile_report
-    HAS_ST_PROFILE = True
-except Exception:
-    HAS_ST_PROFILE = False
+# Page configuration
+st.set_page_config(
+    page_title="AutoML Analytics Platform",
+    layout="wide",
+    page_icon="🤖",
+    initial_sidebar_state="expanded"
+)
 
-# Page config
-st.set_page_config(page_title="Predictive Analytics", layout="wide", page_icon="📊")
-st.title("📊 Predictive Analytics Wizard")
-st.markdown("Predictive modeling simplified: build the models, predict the outcomes and explain the results")
+# Custom CSS for professional appearance
+st.markdown("""
+<style>
+    .main-header {
+        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+        padding: 1rem;
+        border-radius: 10px;
+        color: white;
+        text-align: center;
+        margin-bottom: 2rem;
+    }
+    .metric-container {
+        background: #f8f9fa;
+        padding: 1rem;
+        border-radius: 8px;
+        border-left: 4px solid #667eea;
+    }
+    .status-badge {
+        display: inline-block;
+        padding: 0.25rem 0.75rem;
+        border-radius: 20px;
+        font-size: 0.875rem;
+        font-weight: bold;
+    }
+    .status-success { background: #d4edda; color: #155724; }
+    .status-warning { background: #fff3cd; color: #856404; }
+    .status-info { background: #d1ecf1; color: #0c5460; }
+    .feature-card {
+        background: white;
+        padding: 1.5rem;
+        border-radius: 10px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        margin: 1rem 0;
+    }
+    .sidebar .sidebar-content {
+        background: #f8f9fa;
+    }
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 2px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        height: 60px;
+        background: #f1f3f4;
+        border-radius: 8px 8px 0 0;
+        color: #5f6368;
+        font-weight: 500;
+    }
+    .stTabs [aria-selected="true"] {
+        background: #667eea;
+        color: white;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# Session defaults
-_defaults = {
-    "data_uploaded": False,
-    "profile_generated": False,
-    "model_trained": False,
-    "current_file": None,
-    "data": None,
-    "profile_html_path": None,
-    "trained_clf": None,
-    "trained_feature_cols": None,
-    "trained_le_target": None,
-    "test_results": None,
-    "trained_X_test": None,
-    "trained_y_test": None,
-    "explainer_selected_index": None,
-    # NEW: Parquet-related session states
-    "parquet_converted": False,
-    "parquet_path": None,
-    "original_csv_size": None,
-    "parquet_size": None,
-}
-for k, v in _defaults.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
+# Initialize MLflow if available
+@st.cache_resource
+def init_mlflow():
+    if MLFLOW_AVAILABLE:
+        mlflow.set_tracking_uri("sqlite:///mlflow.db")
+        return mlflow
+    return None
 
-# -------------------------
-# Helper utilities
-# -------------------------
-def safe_filename_base(name: str) -> str:
-    base = Path(name).stem
-    return re.sub(r"[^A-Za-z0-9_\-]", "_", base)[:128]
+mlflow_client = init_mlflow()
 
-def class_counts(y_arr):
-    vc = pd.Series(y_arr).value_counts().sort_index()
-    return {str(k): int(v) for k, v in vc.items()}
+# Session state initialization
+def init_session_state():
+    defaults = {
+        "data_uploaded": False,
+        "profile_generated": False,
+        "model_trained": False,
+        "hyperopt_completed": False,
+        "current_file": None,
+        "data_hash": None,
+        "model_hash": None,
+        "best_params": {},
+        "experiment_history": [],
+        "active_tab": 0
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
-def load_data_safe(uploaded_file):
+init_session_state()
+
+# Utility functions with caching
+@st.cache_data
+def generate_data_hash(df: pd.DataFrame) -> str:
+    """Generate hash for dataframe to enable caching"""
+    return hashlib.md5(pd.util.hash_pandas_object(df, index=True).values).hexdigest()
+
+@st.cache_data
+def load_and_process_data(uploaded_file) -> Tuple[pd.DataFrame, str]:
+    """Load data with caching based on file content"""
     try:
         name = uploaded_file.name.lower()
         if name.endswith(".csv"):
-            return pd.read_csv(uploaded_file)
+            df = pd.read_csv(uploaded_file)
         else:
-            return pd.read_excel(uploaded_file)
-    except Exception:
-        try:
-            uploaded_file.seek(0)
-            return pd.read_excel(uploaded_file)
-        except Exception:
-            uploaded_file.seek(0)
-            return pd.read_csv(uploaded_file)
-
-# NEW: Heavy CSV to Parquet conversion functions
-def get_file_size_mb(file_obj):
-    """Get file size in MB"""
-    try:
-        current_pos = file_obj.tell()
-        file_obj.seek(0, 2)  # Go to end of file
-        size = file_obj.tell()
-        file_obj.seek(current_pos)  # Reset to original position
-        return size / (1024 * 1024)  # Convert to MB
-    except:
-        return 0
-
-def convert_csv_to_parquet(uploaded_file, chunk_size=50000):
-    """Convert heavy CSV to Parquet format with chunked processing"""
-    if not PARQUET_AVAILABLE:
-        st.error("PyArrow is required for Parquet conversion. Please install: pip install pyarrow")
-        return None, None
-    
-    try:
-        # Get original file size
-        original_size = get_file_size_mb(uploaded_file)
-        
-        # Create temporary parquet file
-        temp_dir = tempfile.mkdtemp()
-        parquet_path = os.path.join(temp_dir, f"{safe_filename_base(uploaded_file.name)}.parquet")
-        
-        # Reset file pointer
-        uploaded_file.seek(0)
-        
-        # Read CSV in chunks and write to Parquet
-        first_chunk = True
-        total_rows = 0
-        
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        with st.spinner("Converting CSV to Parquet format..."):
-            # First, count total rows for progress tracking
-            uploaded_file.seek(0)
-            total_lines = sum(1 for _ in uploaded_file) - 1  # Subtract header
-            uploaded_file.seek(0)
-            
-            chunk_count = 0
-            for chunk_df in pd.read_csv(uploaded_file, chunksize=chunk_size):
-                chunk_count += 1
-                total_rows += len(chunk_df)
-                
-                # Update progress
-                progress = min(total_rows / total_lines, 1.0) if total_lines > 0 else 1.0
-                progress_bar.progress(progress)
-                status_text.text(f"Processing chunk {chunk_count}: {total_rows:,} rows processed")
-                
-                # Convert chunk to parquet
-                if first_chunk:
-                    # Create new parquet file
-                    table = pa.Table.from_pandas(chunk_df)
-                    pq.write_table(table, parquet_path)
-                    first_chunk = False
-                else:
-                    # Append to existing parquet file
-                    table = pa.Table.from_pandas(chunk_df)
-                    # Read existing data
-                    existing_table = pq.read_table(parquet_path)
-                    # Concatenate tables
-                    combined_table = pa.concat_tables([existing_table, table])
-                    pq.write_table(combined_table, parquet_path)
-        
-        progress_bar.progress(1.0)
-        status_text.text(f"✅ Conversion complete! Processed {total_rows:,} rows")
-        
-        # Get parquet file size
-        parquet_size = os.path.getsize(parquet_path) / (1024 * 1024)  # MB
-        
-        return parquet_path, {"original_size": original_size, "parquet_size": parquet_size, "rows": total_rows}
-        
+            df = pd.read_excel(uploaded_file)
+        return df, generate_data_hash(df)
     except Exception as e:
-        st.error(f"Failed to convert CSV to Parquet: {e}")
+        st.error(f"Failed to load file: {e}")
         return None, None
 
-def load_parquet_file(parquet_path):
-    """Load data from Parquet file"""
-    try:
-        if PARQUET_AVAILABLE:
-            return pd.read_parquet(parquet_path)
-        else:
-            st.error("PyArrow is required to load Parquet files")
-            return None
-    except Exception as e:
-        st.error(f"Failed to load Parquet file: {e}")
-        return None
-
-def sanitize_dataframe_for_profiling(df: pd.DataFrame, check_n: int = 50) -> pd.DataFrame:
-    if df is None:
-        return pd.DataFrame()
-    if not isinstance(df, pd.DataFrame):
-        df = pd.DataFrame(df)
-    df = df.dropna(axis=1, how="all")
-    for col in df.columns:
-        if df[col].dtype == object:
-            nonnull_sample = df[col].dropna().head(check_n)
-            try:
-                coerced = pd.to_numeric(nonnull_sample)
-                if len(coerced) >= max(1, int(len(nonnull_sample) * 0.9)):
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
-            except Exception:
-                pass
-    # drop nested
-    drop_cols = []
-    for col in df.columns:
-        sample_vals = df[col].dropna().head(check_n).tolist()
-        for v in sample_vals:
-            if isinstance(v, (list, dict, set, tuple, np.ndarray, pd.Series)):
-                drop_cols.append(col)
-                break
-    if drop_cols:
-        df = df.drop(columns=list(set(drop_cols)))
-    nunique = df.nunique(dropna=False)
-    keep_cols = nunique[nunique > 1].index.tolist()
-    df = df.loc[:, keep_cols]
-    df = df.reset_index(drop=True)
-    return df
-
-def generate_profile_html_file(df: pd.DataFrame, tmp_dir: Optional[str] = None) -> str:
+@st.cache_data
+def generate_profile_report(_df: pd.DataFrame, minimal: bool = False) -> str:
+    """Generate profiling report with caching"""
     if ProfileReport is None:
-        out_html = "<h3>Profiling library not installed</h3><p>Install 'ydata-profiling' or 'pandas-profiling' to get full reports.</p>"
-        fd = tempfile.NamedTemporaryFile(delete=False, suffix=".html", dir=tmp_dir)
-        fd.write(out_html.encode("utf-8"))
-        fd.close()
-        return fd.name
-    df_s = sanitize_dataframe_for_profiling(df)
-    if df_s.shape[1] == 0:
-        out_html = "<h3>No columns available to profile after sanitization.</h3>"
-        fd = tempfile.NamedTemporaryFile(delete=False, suffix=".html", dir=tmp_dir)
-        fd.write(out_html.encode("utf-8"))
-        fd.close()
-        return fd.name
-    profile = ProfileReport(df_s, title="Dataset Profiling Report", explorative=True)
-    try:
-        fd = tempfile.NamedTemporaryFile(delete=False, suffix=".html", dir=tmp_dir)
-        fd_path = fd.name
-        fd.close()
-        try:
-            profile.to_file(fd_path)
-            return fd_path
-        except Exception:
-            html_str = profile.to_html()
-            with open(fd_path, "w", encoding="utf-8") as fh:
-                fh.write(html_str)
-            return fd_path
-    except Exception:
-        fd = tempfile.NamedTemporaryFile(delete=False, suffix=".html", dir=tmp_dir)
-        with open(fd.name, "w", encoding="utf-8") as fh:
-            fh.write("<h3>Profiler failed to export.</h3>")
-        return fd.name
+        return "<h3>Profiling library not available</h3>"
+    
+    # Create sanitized copy
+    df_clean = _df.copy()
+    df_clean = df_clean.select_dtypes(exclude=['object']).fillna(df_clean.mean())
+    
+    profile = ProfileReport(
+        df_clean,
+        title="Dataset Profile",
+        minimal=minimal,
+        explorative=not minimal
+    )
+    
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".html")
+    profile.to_file(temp_file.name)
+    
+    with open(temp_file.name, 'r', encoding='utf-8') as f:
+        html_content = f.read()
+    
+    os.unlink(temp_file.name)
+    return html_content
 
 def safe_onehot_encoder():
+    """Create OneHotEncoder compatible with different sklearn versions"""
     try:
         return OneHotEncoder(handle_unknown="ignore", sparse_output=False)
     except TypeError:
         return OneHotEncoder(handle_unknown="ignore", sparse=False)
 
-def make_pdp_values(clf_pipeline, base_row_df, feature, grid):
-    preds = []
-    for v in grid:
-        temp = base_row_df.copy()
-        temp[feature] = v
-        try:
-            if hasattr(clf_pipeline, "predict_proba"):
-                p = clf_pipeline.predict_proba(temp)
-                preds.append(float(np.max(p)))
-            else:
-                p = clf_pipeline.predict(temp)
-                preds.append(float(np.ravel(p)[0]))
-        except Exception:
-            preds.append(np.nan)
-    return preds
-
-# -------------------------
-# Sidebar upload
-# -------------------------
-with st.sidebar:
-    st.header("📁 Data Upload")
-    uploaded_file = st.file_uploader("Upload dataset (CSV or XLSX)", type=["csv", "xlsx"])
+# Enhanced model training with hyperparameter optimization
+@st.cache_resource
+def optimize_hyperparameters(X, y, model_name: str, n_trials: int = 50):
+    """Hyperparameter optimization with Optuna"""
+    if not OPTUNA_AVAILABLE:
+        return {}
     
-    # NEW: Parquet conversion section
-    if uploaded_file and uploaded_file.name.lower().endswith('.csv'):
-        file_size = get_file_size_mb(uploaded_file)
-        if file_size > 10:  # Show option for files larger than 10MB
-            st.markdown("---")
-            st.subheader("🚀 Heavy CSV Optimization")
-            st.info(f"File size: {file_size:.1f} MB - Consider converting to Parquet for faster processing!")
+    def objective(trial):
+        if model_name == "Random Forest":
+            params = {
+                'n_estimators': trial.suggest_int('n_estimators', 50, 300),
+                'max_depth': trial.suggest_int('max_depth', 3, 20),
+                'min_samples_split': trial.suggest_int('min_samples_split', 2, 20),
+                'min_samples_leaf': trial.suggest_int('min_samples_leaf', 1, 10)
+            }
+            model = RandomForestClassifier(**params, random_state=42)
+        elif model_name == "Gradient Boosting":
+            params = {
+                'n_estimators': trial.suggest_int('n_estimators', 50, 200),
+                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
+                'max_depth': trial.suggest_int('max_depth', 3, 10)
+            }
+            model = GradientBoostingClassifier(**params, random_state=42)
+        elif model_name == "SVM":
+            params = {
+                'C': trial.suggest_float('C', 0.1, 10.0),
+                'kernel': trial.suggest_categorical('kernel', ['rbf', 'linear']),
+                'gamma': trial.suggest_categorical('gamma', ['scale', 'auto'])
+            }
+            model = SVC(**params, probability=True, random_state=42)
+        else:
+            return 0.0
+        
+        # Simple preprocessing
+        numeric_features = X.select_dtypes(include=[np.number]).columns
+        categorical_features = X.select_dtypes(exclude=[np.number]).columns
+        
+        preprocessor = ColumnTransformer(
+            transformers=[
+                ('num', StandardScaler(), numeric_features),
+                ('cat', safe_onehot_encoder(), categorical_features)
+            ]
+        )
+        
+        pipeline = Pipeline([
+            ('preprocessor', preprocessor),
+            ('classifier', model)
+        ])
+        
+        scores = cross_val_score(pipeline, X, y, cv=3, scoring='f1_weighted')
+        return scores.mean()
+    
+    study = optuna.create_study(direction='maximize')
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    
+    return study.best_params
+
+# SHAP explanations
+@st.cache_data
+def generate_shap_values(_model, _X_sample, model_type: str):
+    """Generate SHAP values with caching"""
+    if not SHAP_AVAILABLE:
+        return None, None
+    
+    try:
+        if model_type in ['Random Forest', 'Gradient Boosting', 'Decision Tree']:
+            # Get the actual classifier from pipeline
+            classifier = _model.named_steps.get('classifier', _model)
+            explainer = shap.TreeExplainer(classifier)
             
-            if PARQUET_AVAILABLE:
-                if st.button("⚡ Convert to Parquet", help="Convert large CSV to Parquet format for 5-10x faster processing"):
-                    parquet_path, conversion_info = convert_csv_to_parquet(uploaded_file)
-                    if parquet_path and conversion_info:
-                        st.session_state.parquet_converted = True
-                        st.session_state.parquet_path = parquet_path
-                        st.session_state.original_csv_size = conversion_info["original_size"]
-                        st.session_state.parquet_size = conversion_info["parquet_size"]
-                        
-                        # Show conversion results
-                        reduction = ((conversion_info["original_size"] - conversion_info["parquet_size"]) / conversion_info["original_size"]) * 100
-                        st.success(f"✅ Converted successfully!")
-                        st.metric("Size Reduction", f"{reduction:.1f}%")
-                        st.metric("Original Size", f"{conversion_info['original_size']:.1f} MB")
-                        st.metric("Parquet Size", f"{conversion_info['parquet_size']:.1f} MB")
-                        
-                # Option to use parquet if available
-                if st.session_state.parquet_converted and st.session_state.parquet_path:
-                    use_parquet = st.checkbox("🏎️ Use Parquet (Faster)", value=True, 
-                                            help="Use the converted Parquet file for faster processing")
-                    if use_parquet and st.button("📥 Load Parquet Data"):
-                        df = load_parquet_file(st.session_state.parquet_path)
-                        if df is not None:
-                            st.session_state.data = df
-                            st.session_state.data_uploaded = True
-                            st.session_state.current_file = uploaded_file.name + " (Parquet)"
-                            st.success("✅ Parquet data loaded successfully!")
-            else:
-                st.warning("Install PyArrow for Parquet conversion: `pip install pyarrow`")
+            # Transform the data using the preprocessor
+            X_transformed = _model.named_steps['preprocessor'].transform(_X_sample)
+            shap_values = explainer.shap_values(X_transformed)
+            
+            # Get feature names
+            feature_names = _model.named_steps['preprocessor'].get_feature_names_out()
+            
+            return shap_values, feature_names
+        else:
+            # For other models, use KernelExplainer
+            explainer = shap.KernelExplainer(_model.predict_proba, _X_sample.sample(min(100, len(_X_sample))))
+            shap_values = explainer.shap_values(_X_sample.head(10))
+            return shap_values, _X_sample.columns.tolist()
+    except Exception as e:
+        st.warning(f"SHAP explanation failed: {e}")
+        return None, None
+
+def create_shap_plots(shap_values, feature_names, X_sample):
+    """Create SHAP visualization plots"""
+    if shap_values is None:
+        return None, None
+    
+    # Summary plot
+    fig_summary, ax_summary = plt.subplots(figsize=(10, 6))
+    if isinstance(shap_values, list) and len(shap_values) > 1:
+        # Multi-class case
+        shap.summary_plot(shap_values[1], X_sample.iloc[:len(shap_values[1])], 
+                         feature_names=feature_names, show=False, ax=ax_summary)
+    else:
+        # Binary or single-class case
+        shap_vals = shap_values[0] if isinstance(shap_values, list) else shap_values
+        shap.summary_plot(shap_vals, X_sample.iloc[:len(shap_vals)], 
+                         feature_names=feature_names, show=False, ax=ax_summary)
+    
+    plt.title("SHAP Feature Importance Summary")
+    plt.tight_layout()
+    
+    # Waterfall plot for first instance
+    fig_waterfall, ax_waterfall = plt.subplots(figsize=(10, 6))
+    try:
+        if isinstance(shap_values, list):
+            shap_vals = shap_values[1] if len(shap_values) > 1 else shap_values[0]
+        else:
+            shap_vals = shap_values
+        
+        # Create waterfall plot manually since shap.waterfall_plot might not work in all cases
+        instance_shap = shap_vals[0]
+        sorted_idx = np.argsort(np.abs(instance_shap))[-10:]  # Top 10 features
+        
+        ax_waterfall.barh(range(len(sorted_idx)), instance_shap[sorted_idx])
+        ax_waterfall.set_yticks(range(len(sorted_idx)))
+        ax_waterfall.set_yticklabels([feature_names[i] for i in sorted_idx])
+        ax_waterfall.set_xlabel("SHAP Value")
+        ax_waterfall.set_title("SHAP Values for First Prediction")
+        plt.tight_layout()
+    except Exception:
+        ax_waterfall.text(0.5, 0.5, "Waterfall plot unavailable", 
+                         transform=ax_waterfall.transAxes, ha='center')
+    
+    return fig_summary, fig_waterfall
+
+# Model download functionality
+def create_model_download_package(model, feature_cols, le_target, model_name, metrics):
+    """Create downloadable model package"""
+    model_package = {
+        'model': model,
+        'feature_columns': feature_cols,
+        'label_encoder': le_target,
+        'model_name': model_name,
+        'metrics': metrics,
+        'timestamp': pd.Timestamp.now().isoformat(),
+        'version': '1.0'
+    }
+    
+    # Serialize model
+    buffer = io.BytesIO()
+    joblib.dump(model_package, buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+# Header
+st.markdown("""
+<div class="main-header">
+    <h1>🤖 AutoML Analytics Platform</h1>
+    <p>Professional predictive modeling with advanced explanations and automated optimization</p>
+</div>
+""", unsafe_allow_html=True)
+
+# Sidebar with enhanced status
+with st.sidebar:
+    st.markdown("### 📊 Platform Status")
+    
+    # Status indicators
+    status_data = [
+        ("Data", st.session_state.data_uploaded, "✅" if st.session_state.data_uploaded else "⏳"),
+        ("Model", st.session_state.model_trained, "✅" if st.session_state.model_trained else "⏳"),
+        ("Optimization", st.session_state.hyperopt_completed, "✅" if st.session_state.hyperopt_completed else "⏳")
+    ]
+    
+    for label, status, icon in status_data:
+        badge_class = "status-success" if status else "status-info"
+        st.markdown(f"""
+        <div class="status-badge {badge_class}">
+            {icon} {label}
+        </div>
+        """, unsafe_allow_html=True)
     
     st.markdown("---")
-    st.write("Status:")
-    st.write(f"- Data uploaded: {st.session_state.data_uploaded}")
-    st.write(f"- Model trained: {st.session_state.model_trained}")
-    # NEW: Show parquet status
-    if st.session_state.parquet_converted:
-        st.write("- Parquet converted: ✅")
+    
+    # File upload
+    st.markdown("### 📁 Data Upload")
+    uploaded_file = st.file_uploader(
+        "Upload CSV or Excel file",
+        type=["csv", "xlsx", "xls"],
+        help="Upload your dataset for analysis"
+    )
+    
+    if uploaded_file:
+        with st.spinner("Loading data..."):
+            df, data_hash = load_and_process_data(uploaded_file)
+            if df is not None:
+                st.session_state.data = df
+                st.session_state.data_uploaded = True
+                st.session_state.data_hash = data_hash
+                st.session_state.current_file = uploaded_file.name
+                
+                st.success("Data loaded successfully!")
+                st.info(f"Shape: {df.shape[0]:,} rows × {df.shape[1]} columns")
+    
+    # Library status
+    st.markdown("---")
+    st.markdown("### 🔧 Available Features")
+    
+    features_status = [
+        ("SHAP Explanations", SHAP_AVAILABLE),
+        ("Hyperopt (Optuna)", OPTUNA_AVAILABLE),
+        ("Experiment Tracking", MLFLOW_AVAILABLE),
+        ("Data Profiling", ProfileReport is not None),
+        ("Class Balancing", IMB_AVAILABLE)
+    ]
+    
+    for feature, available in features_status:
+        icon = "✅" if available else "❌"
+        st.markdown(f"{icon} {feature}")
 
-if uploaded_file:
-    # Only process if not using parquet or parquet not available
-    if not (st.session_state.parquet_converted and st.session_state.get('use_parquet', False)):
-        try:
-            df = load_data_safe(uploaded_file)
-            st.session_state.data = df
-            st.session_state.data_uploaded = True
-            st.session_state.current_file = uploaded_file.name
-            st.success("✅ Data uploaded successfully")
-            st.write(f"**Shape:** {df.shape}")
-            with st.expander("Preview (first 5 rows)"):
-                st.dataframe(df.head(5))
-        except Exception as e:
-            st.error(f"Failed to load file: {e}")
-            st.session_state.data_uploaded = False
-else:
-    if st.session_state.data is None:
-        st.session_state.data_uploaded = False
+# Main tabs with enhanced navigation
+tab_names = ["📊 Data Explorer", "🚀 Model Lab", "🔍 Model Insights", "📈 Predictions"]
+tabs = st.tabs(tab_names)
 
-# Tabs
-tab1, tab2, tab3, tab4 = st.tabs(["📊 Data Profiling", "🚀 Model Development", "🔍 Model Evaluation & Explain", "📈 Predictions"])
-
-# -------------------------
-# TAB 1: DATA PROFILING
-# -------------------------
-with tab1:
-    st.header("📊 Data Profiling") 
-    st.markdown("Generate a profiling report and embed it here.")
+# Tab 1: Data Explorer
+with tabs[0]:
+    st.markdown("## 📊 Data Explorer & Profiling")
+    
     if not st.session_state.data_uploaded:
-        st.info("👈 Upload a dataset in the sidebar to begin profiling.")
+        st.info("👈 Upload a dataset in the sidebar to start exploring")
     else:
         df = st.session_state.data
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            st.metric("Rows", df.shape[0])
-        with c2:
+        
+        # Data overview cards
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric("Rows", f"{df.shape[0]:,}")
+        with col2:
             st.metric("Columns", df.shape[1])
-        with c3:
-            mem_mb = df.memory_usage(deep=True).sum() / 1024**2
-            st.metric("Memory", f"{mem_mb:.1f} MB")
-        with c4:
-            st.metric("Missing values", int(df.isnull().sum().sum()))
+        with col3:
+            memory_mb = df.memory_usage(deep=True).sum() / 1024**2
+            st.metric("Memory", f"{memory_mb:.1f} MB")
+        with col4:
+            missing_pct = (df.isnull().sum().sum() / (df.shape[0] * df.shape[1])) * 100
+            st.metric("Missing %", f"{missing_pct:.1f}%")
+        
+        # Data preview with pagination
+        st.markdown("### 🔍 Data Preview")
+        
+        # Pagination controls
+        page_size = st.selectbox("Rows per page", [10, 25, 50, 100], index=1)
+        total_pages = (len(df) - 1) // page_size + 1
+        
+        if total_pages > 1:
+            page = st.selectbox("Page", range(1, total_pages + 1))
+            start_idx = (page - 1) * page_size
+            end_idx = min(start_idx + page_size, len(df))
+            display_df = df.iloc[start_idx:end_idx]
+        else:
+            display_df = df.head(page_size)
+        
+        st.dataframe(display_df, use_container_width=True)
+        
+        # Column information
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("### 📋 Column Info")
+            col_info = pd.DataFrame({
+                'Column': df.columns,
+                'Type': df.dtypes.astype(str),
+                'Missing': df.isnull().sum(),
+                'Missing %': (df.isnull().sum() / len(df) * 100).round(2),
+                'Unique': df.nunique()
+            })
+            st.dataframe(col_info, use_container_width=True)
+        
+        with col2:
+            st.markdown("### 📊 Data Types Distribution")
+            dtype_counts = df.dtypes.value_counts()
+            st.bar_chart(dtype_counts)
+        
+        # Profiling report
+        st.markdown("### 📈 Automated Profiling Report")
+        
+        profile_options = st.columns(3)
+        with profile_options[0]:
+            profile_type = st.radio("Report Type", ["Quick", "Detailed"], index=0)
+        with profile_options[1]:
+            if st.button("Generate Profile Report", type="primary"):
+                with st.spinner("Generating profile report..."):
+                    minimal = (profile_type == "Quick")
+                    html_content = generate_profile_report(df, minimal=minimal)
+                    st.session_state.profile_html = html_content
+                    st.session_state.profile_generated = True
+        
+        if st.session_state.get('profile_generated', False):
+            components.html(st.session_state.profile_html, height=800, scrolling=True)
 
-        # NEW: Show file format info
-        if st.session_state.parquet_converted and "Parquet" in st.session_state.current_file:
-            st.info(f"📦 Using optimized Parquet format - Original CSV: {st.session_state.original_csv_size:.1f}MB → Parquet: {st.session_state.parquet_size:.1f}MB")
-
-        with st.expander("Quick Preview"):
-            st.dataframe(df.head(5))
-
-        if st.button("🔍 Generate & Embed Profile Report (HTML)"):
-            if ProfileReport is None:
-                st.error("Profiling library not installed. Add 'ydata-profiling' or 'pandas-profiling' to your environment.")
-            else:
-                with st.spinner("Generating profile HTML..."):
-                    try:
-                        profile_html_path = generate_profile_html_file(df)
-                        st.session_state.profile_html_path = profile_html_path
-                        st.session_state.profile_generated = True
-                        st.success("✅ Profiling HTML generated.")
-                    except Exception as e:
-                        st.error(f"Profile generation failed: {e}")
-                        st.text(traceback.format_exc())
-
-        if st.session_state.profile_generated and st.session_state.profile_html_path:
-            st.subheader("📋 Embedded Profiling Report")
-            try:
-                with open(st.session_state.profile_html_path, "r", encoding="utf-8") as fh:
-                    html_content = fh.read()
-                components.html(html_content, height=800, scrolling=True)
-            except Exception as e:
-                st.error(f"Failed to read/embed profile HTML: {e}")
-                st.text(traceback.format_exc())
-
-# -------------------------
-# TAB 2: MODEL DEVELOPMENT
-# -------------------------
-with tab2:
-    st.header("🚀 Model Development")
-    st.markdown("Select target, features, algorithm, and train the model.")
+# Tab 2: Model Lab
+with tabs[1]:
+    st.markdown("## 🚀 Model Development Lab")
+    
     if not st.session_state.data_uploaded:
-        st.info("👈 Upload data in the sidebar first.")
+        st.info("👈 Upload data first to start model development")
     else:
         data = st.session_state.data.copy()
-        all_cols = list(data.columns)
-        target_column = st.selectbox("Choose target column", all_cols)
-        available_features = [c for c in all_cols if c != target_column]
-        feature_mode = st.radio("Feature selection:", ["Use all features", "Select features"], horizontal=True)
-        if feature_mode == "Select features":
-            feature_cols = st.multiselect("Pick features", available_features, default=available_features)
+        
+        # Model configuration section
+        st.markdown("### ⚙️ Model Configuration")
+        
+        config_col1, config_col2 = st.columns(2)
+        
+        with config_col1:
+            # Target selection
+            all_columns = list(data.columns)
+            target_column = st.selectbox(
+                "🎯 Target Variable",
+                all_columns,
+                help="Select the column you want to predict"
+            )
+        
+        with config_col2:
+            # Feature selection
+            available_features = [col for col in all_columns if col != target_column]
+            feature_mode = st.radio(
+                "🔧 Feature Selection",
+                ["Auto-select all", "Manual selection"],
+                horizontal=True
+            )
+        
+        if feature_mode == "Manual selection":
+            feature_cols = st.multiselect(
+                "Select features",
+                available_features,
+                default=available_features
+            )
             if not feature_cols:
-                st.warning("Select at least one feature.")
+                st.warning("Please select at least one feature")
                 st.stop()
         else:
             feature_cols = available_features
-
+        
+        # Prepare data
         X = data[feature_cols].copy()
         y_raw = data[target_column].copy()
-
+        
+        # Handle target encoding
         if y_raw.dtype == "object" or y_raw.nunique() < 20:
             le_target = LabelEncoder()
             y = le_target.fit_transform(y_raw.astype(str))
-            class_names = [str(c) for c in le_target.classes_]
+            class_names = le_target.classes_.tolist()
+            problem_type = "classification"
         else:
             le_target = None
             y = y_raw.to_numpy()
-            class_names = [str(c) for c in np.unique(y)]
+            class_names = None
+            problem_type = "regression"
+        
+        # Target distribution
+        st.markdown("### 📊 Target Variable Analysis")
+        target_col1, target_col2 = st.columns(2)
+        
+        with target_col1:
+            if problem_type == "classification":
+                target_dist = pd.Series(y).value_counts().sort_index()
+                st.bar_chart(target_dist)
+            else:
+                fig, ax = plt.subplots(figsize=(8, 4))
+                ax.hist(y, bins=30, alpha=0.7)
+                ax.set_title("Target Distribution")
+                st.pyplot(fig)
+        
+        with target_col2:
+            if problem_type == "classification":
+                class_dist = pd.DataFrame({
+                    'Class': class_names,
+                    'Count': pd.Series(y).value_counts().sort_index().values,
+                    'Percentage': (pd.Series(y).value_counts().sort_index().values / len(y) * 100).round(2)
+                })
+                st.dataframe(class_dist, use_container_width=True)
+            else:
+                stats_df = pd.DataFrame({
+                    'Statistic': ['Mean', 'Median', 'Std', 'Min', 'Max'],
+                    'Value': [y.mean(), np.median(y), y.std(), y.min(), y.max()]
+                })
+                st.dataframe(stats_df, use_container_width=True)
+        
+        # Model selection and configuration
+        st.markdown("### 🤖 Algorithm Selection")
+        
+        model_col1, model_col2 = st.columns(2)
+        
+        with model_col1:
+            model_options = {
+                "Logistic Regression": LogisticRegression(max_iter=1000),
+                "Random Forest": RandomForestClassifier(random_state=42),
+                "Gradient Boosting": GradientBoostingClassifier(random_state=42),
+                "SVM": SVC(probability=True, random_state=42),
+                "Decision Tree": DecisionTreeClassifier(random_state=42)
+            }
+            
+            model_choice = st.selectbox("Select Algorithm", list(model_options.keys()), index=1)
+            base_model = model_options[model_choice]
+        
+        with model_col2:
+            # Hyperparameter optimization toggle
+            use_hyperopt = st.checkbox(
+                "🔍 Enable Hyperparameter Optimization",
+                value=OPTUNA_AVAILABLE,
+                disabled=not OPTUNA_AVAILABLE,
+                help="Automatically find the best parameters for your model"
+            )
+            
+            if use_hyperopt and OPTUNA_AVAILABLE:
+                n_trials = st.slider("Optimization Trials", 10, 100, 50, step=10)
+        
+        # Advanced options
+        with st.expander("🔧 Advanced Configuration"):
+            adv_col1, adv_col2 = st.columns(2)
+            
+            with adv_col1:
+                # Class balancing
+                balance_options = ["None"]
+                if IMB_AVAILABLE:
+                    balance_options.extend(["SMOTE", "Random Oversample", "Random Undersample"])
+                
+                balance_method = st.selectbox("Class Balancing", balance_options)
+                
+                # Train/test split
+                test_size = st.slider("Test Size (%)", 10, 50, 20, step=5)
+            
+            with adv_col2:
+                # Cross-validation
+                cv_folds = st.slider("CV Folds", 3, 10, 5)
+                
+                # Random seed
+                random_seed = st.number_input("Random Seed", 0, 999, 42)
+        
+        # Training section
+        st.markdown("### 🏃‍♂️ Model Training")
+        
+        train_col1, train_col2 = st.columns(2)
+        
+        with train_col1:
+            if st.button("🚀 Train Model", type="primary", use_container_width=True):
+                if len(np.unique(y)) < 2:
+                    st.error("Need at least 2 classes in target variable")
+                else:
+                    training_placeholder = st.empty()
+                    progress_bar = st.progress(0)
+                    
+                    try:
+                        # Split data
+                        X_train, X_test, y_train, y_test = train_test_split(
+                            X, y, test_size=test_size/100, random_state=random_seed,
+                            stratify=y if problem_type == "classification" else None
+                        )
+                        
+                        progress_bar.progress(25)
+                        training_placeholder.info("🔄 Preparing data pipeline...")
+                        
+                        # Create preprocessing pipeline
+                        numeric_features = X.select_dtypes(include=[np.number]).columns
+                        categorical_features = X.select_dtypes(exclude=[np.number]).columns
+                        
+                        preprocessor = ColumnTransformer(
+                            transformers=[
+                                ('num', StandardScaler(), numeric_features),
+                                ('cat', safe_onehot_encoder(), categorical_features)
+                            ]
+                        )
+                        
+                        # Handle class balancing
+                        pipeline_steps = [('preprocessor', preprocessor)]
+                        
+                        if balance_method != "None" and IMB_AVAILABLE:
+                            if balance_method == "SMOTE":
+                                sampler = SMOTE(random_state=random_seed)
+                            elif balance_method == "Random Oversample":
+                                sampler = RandomOverSampler(random_state=random_seed)
+                            elif balance_method == "Random Undersample":
+                                sampler = RandomUnderSampler(random_state=random_seed)
+                            pipeline_steps.append(('sampler', sampler))
+                        
+                        progress_bar.progress(50)
+                        
+                        # Hyperparameter optimization
+                        if use_hyperopt and OPTUNA_AVAILABLE:
+                            training_placeholder.info("🔍 Optimizing hyperparameters...")
+                            
+                            best_params = optimize_hyperparameters(X_train, y_train, model_choice, n_trials)
+                            st.session_state.best_params = best_params
+                            st.session_state.hyperopt_completed = True
+                            
+                            # Update model with best parameters
+                            base_model.set_params(**best_params)
+                        
+                        progress_bar.progress(75)
+                        training_placeholder.info("🏋️‍♂️ Training model...")
+                        
+                        # Add model to pipeline
+                        pipeline_steps.append(('classifier', base_model))
+                        
+                        if IMB_AVAILABLE and any('sampler' in step[0] for step in pipeline_steps):
+                            model_pipeline = ImbPipeline(pipeline_steps)
+                        else:
+                            model_pipeline = Pipeline(pipeline_steps)
+                        
+                        # Train model
+                        model_pipeline.fit(X_train, y_train)
+                        
+                        # Evaluate model
+                        y_pred = model_pipeline.predict(X_test)
+                        
+                        if problem_type == "classification":
+                            accuracy = accuracy_score(y_test, y_pred)
+                            f1 = f1_score(y_test, y_pred, average='weighted')
+                            metrics = {'accuracy': accuracy, 'f1_score': f1}
+                        else:
+                            from sklearn.metrics import mean_squared_error, r2_score
+                            mse = mean_squared_error(y_test, y_pred)
+                            r2 = r2_score(y_test, y_pred)
+                            metrics = {'mse': mse, 'r2_score': r2}
+                        
+                        progress_bar.progress(100)
+                        training_placeholder.empty()
+                        
+                        # Save model results to session state
+                        st.session_state.model_trained = True
+                        st.session_state.trained_model = model_pipeline
+                        st.session_state.trained_feature_cols = feature_cols
+                        st.session_state.trained_le_target = le_target
+                        st.session_state.trained_class_names = class_names
+                        st.session_state.test_results = {
+                            'y_test': y_test, 'y_pred': y_pred, 'metrics': metrics
+                        }
+                        st.session_state.trained_X_test = X_test
+                        st.session_state.model_name = model_choice
+                        st.session_state.problem_type = problem_type
+                        
+                        # MLflow logging
+                        if mlflow_client:
+                            with mlflow.start_run(run_name=f"{model_choice}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}"):
+                                mlflow.log_params({
+                                    'algorithm': model_choice,
+                                    'features': len(feature_cols),
+                                    'balance_method': balance_method,
+                                    'test_size': test_size
+                                })
+                                mlflow.log_metrics(metrics)
+                                if use_hyperopt and st.session_state.best_params:
+                                    mlflow.log_params(st.session_state.best_params)
+                                mlflow.sklearn.log_model(model_pipeline, "model")
+                        
+                        st.success(f"Model trained successfully! {list(metrics.items())[0][0].title()}: {list(metrics.values())[0]:.3f}")
+                        
+                    except Exception as e:
+                        st.error(f"Training failed: {str(e)}")
+                        st.text(traceback.format_exc())
+        
+        with train_col2:
+            # Model download section
+            if st.session_state.model_trained:
+                st.markdown("**Download Trained Model**")
+                
+                model_package = create_model_download_package(
+                    st.session_state.trained_model,
+                    st.session_state.trained_feature_cols,
+                    st.session_state.trained_le_target,
+                    st.session_state.model_name,
+                    st.session_state.test_results['metrics']
+                )
+                
+                filename = f"automl_model_{st.session_state.model_name.lower().replace(' ', '_')}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.pkl"
+                
+                st.download_button(
+                    label="📦 Download Model Package",
+                    data=model_package,
+                    file_name=filename,
+                    mime="application/octet-stream",
+                    help="Download complete model package with preprocessing pipeline"
+                )
+        
+        # Training results display
+        if st.session_state.model_trained:
+            st.markdown("### 📊 Training Results")
+            
+            results_col1, results_col2, results_col3 = st.columns(3)
+            
+            metrics = st.session_state.test_results['metrics']
+            metric_items = list(metrics.items())
+            
+            with results_col1:
+                st.metric(metric_items[0][0].replace('_', ' ').title(), f"{metric_items[0][1]:.3f}")
+            
+            if len(metric_items) > 1:
+                with results_col2:
+                    st.metric(metric_items[1][0].replace('_', ' ').title(), f"{metric_items[1][1]:.3f}")
+            
+            with results_col3:
+                st.metric("Features Used", len(st.session_state.trained_feature_cols))
+            
+            # Hyperparameter optimization results
+            if st.session_state.hyperopt_completed and st.session_state.best_params:
+                st.markdown("#### 🔍 Optimized Hyperparameters")
+                params_df = pd.DataFrame(
+                    list(st.session_state.best_params.items()),
+                    columns=['Parameter', 'Value']
+                )
+                st.dataframe(params_df, use_container_width=True)
 
-        st.subheader("📊 Target Distribution")
-        a1, a2 = st.columns(2)
-        with a1:
-            st.write(class_counts(y))
-        with a2:
+# Tab 3: Model Insights
+with tabs[2]:
+    st.markdown("## 🔍 Model Insights & Explainability")
+    
+    if not st.session_state.data_uploaded:
+        st.info("Upload data and train a model first to see insights")
+    elif not st.session_state.model_trained:
+        st.info("Train a model in the Model Lab to see detailed insights")
+    else:
+        model = st.session_state.trained_model
+        X_test = st.session_state.trained_X_test
+        y_test = st.session_state.test_results['y_test']
+        y_pred = st.session_state.test_results['y_pred']
+        model_name = st.session_state.model_name
+        problem_type = st.session_state.problem_type
+        
+        # Model performance overview
+        st.markdown("### 📈 Performance Overview")
+        
+        perf_col1, perf_col2 = st.columns(2)
+        
+        with perf_col1:
+            if problem_type == "classification":
+                # Confusion Matrix
+                cm = confusion_matrix(y_test, y_pred)
+                fig_cm, ax_cm = plt.subplots(figsize=(8, 6))
+                sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax_cm)
+                ax_cm.set_title('Confusion Matrix')
+                ax_cm.set_ylabel('Actual')
+                ax_cm.set_xlabel('Predicted')
+                st.pyplot(fig_cm)
+        
+        with perf_col2:
+            # Classification Report
+            if problem_type == "classification":
+                report = classification_report(y_test, y_pred, output_dict=True)
+                report_df = pd.DataFrame(report).transpose().round(3)
+                st.markdown("**Classification Report**")
+                st.dataframe(report_df, use_container_width=True)
+        
+        # ROC Curve for binary classification
+        if problem_type == "classification" and len(np.unique(y_test)) == 2:
             try:
-                dist_df = pd.DataFrame(list(class_counts(y).items()), columns=["class", "count"]).set_index("class")
-                st.bar_chart(dist_df)
+                y_proba = model.predict_proba(X_test)[:, 1]
+                fpr, tpr, _ = roc_curve(y_test, y_proba)
+                roc_auc = auc(fpr, tpr)
+                
+                fig_roc, ax_roc = plt.subplots(figsize=(8, 6))
+                ax_roc.plot(fpr, tpr, linewidth=2, label=f'ROC Curve (AUC = {roc_auc:.3f})')
+                ax_roc.plot([0, 1], [0, 1], 'k--', linewidth=1)
+                ax_roc.set_xlabel('False Positive Rate')
+                ax_roc.set_ylabel('True Positive Rate')
+                ax_roc.set_title('ROC Curve')
+                ax_roc.legend()
+                ax_roc.grid(True, alpha=0.3)
+                st.pyplot(fig_roc)
             except Exception:
                 pass
-
-        st.subheader("🤖 Model Selection")
-        model_map = {
-            "Logistic Regression": LogisticRegression(max_iter=1000),
-            "SVM": SVC(probability=True),
-            "Decision Tree": DecisionTreeClassifier(),
-            "Random Forest": RandomForestClassifier(random_state=42),
-            "Gradient Boosting": GradientBoostingClassifier(),
-        }
-        model_choice = st.selectbox("Algorithm", list(model_map.keys()), index=3)
-        model = model_map[model_choice]
-
-        with st.expander("⚙️ Hyperparameters (optional)"):
-            if model_choice in ["Logistic Regression", "SVM"]:
-                C_val = st.slider("C", 0.01, 10.0, 1.0)
-                model.set_params(C=C_val)
-            if model_choice == "SVM":
-                kernel = st.selectbox("Kernel", ["linear", "rbf", "poly"], index=1)
-                model.set_params(kernel=kernel)
-            if model_choice == "Random Forest":
-                n_estimators = st.slider("n_estimators", 50, 500, 200, step=50)
-                max_depth = st.slider("max_depth (0 = no limit)", 0, 30, 0)
-                model.set_params(n_estimators=n_estimators, max_depth=(None if max_depth == 0 else max_depth))
-
-        st.subheader("⚖️ Class Balancing")
-        balance = st.selectbox("Balancing", ["None", "SMOTE", "Random Oversample", "Random Undersample"])
-        sampler = None
-        if balance == "SMOTE" and IMB_AVAILABLE:
-            sampler = SMOTE(random_state=42)
-        elif balance == "Random Oversample" and IMB_AVAILABLE:
-            sampler = RandomOverSampler(random_state=42)
-        elif balance == "Random Undersample" and IMB_AVAILABLE:
-            sampler = RandomUnderSampler(random_state=42)
-        elif balance != "None" and not IMB_AVAILABLE:
-            st.warning("imbalanced-learn not installed — balancing options are disabled")
-
-        st.subheader("📊 Train/Test Split")
-        test_pct = st.slider("Test size (%)", 10, 50, 20)
-
-        numeric_feats = X.select_dtypes(include=np.number).columns.tolist()
-        categorical_feats = X.select_dtypes(exclude=np.number).columns.tolist()
-
-        numeric_transformer = Pipeline([("scaler", StandardScaler())])
-        ohe = safe_onehot_encoder()
-        categorical_transformer = Pipeline([("onehot", ohe)])
-
-        preprocessor = ColumnTransformer(
-            [("num", numeric_transformer, numeric_feats), ("cat", categorical_transformer, categorical_feats)],
-            remainder="drop",
-        )
-
-        if sampler is None:
-            clf_pipeline = ImbPipeline(steps=[("preprocessor", preprocessor), ("classifier", model)])
-        else:
-            clf_pipeline = ImbPipeline(steps=[("preprocessor", preprocessor), ("sampler", sampler), ("classifier", model)])
-
-        st.markdown("---")
-        if st.button("🚀 Train Model", use_container_width=True):
-            try:
-                unique = np.unique(y)
-                if len(unique) < 2:
-                    st.error("Need at least 2 classes/values in target to train.")
-                else:
-                    with st.spinner("Training..."):
-                        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_pct / 100.0, random_state=42, stratify=(y if len(unique) >= 2 else None))
-                        clf_pipeline.fit(X_train, y_train)
-                        y_pred = clf_pipeline.predict(X_test)
-                        acc = accuracy_score(y_test, y_pred)
-
-                        st.session_state.model_trained = True
-                        st.session_state.trained_clf = clf_pipeline
-                        st.session_state.trained_le_target = le_target
-                        st.session_state.trained_feature_cols = feature_cols
-                        st.session_state.trained_class_names = class_names
-                        st.session_state.test_results = {"y_test": np.array(y_test), "y_pred": np.array(y_pred), "accuracy": float(acc)}
-                        st.session_state.trained_X_test = X_test.reset_index(drop=True)
-                        st.session_state.trained_y_test = np.array(y_test)
-
-                        st.success(f"✅ Trained. Accuracy: {acc:.3f}")
-            except Exception as e:
-                st.error(f"Training failed: {e}")
-                st.text(traceback.format_exc())
-
-# -------------------------
-# TAB 3: MODEL EVALUATION & FALLBACK VISUAL EXPLAINER
-# -------------------------
-with tab3:
-    st.header("🔍 Model Evaluation & Visual Explainer")
-    st.markdown("Model evaluation diagnostics to understand model behavior and key variables impacting the target variable.")
-
-    if not st.session_state.data_uploaded:
-        st.info("👈 Upload data first.")
-    elif not st.session_state.model_trained:
-        st.info("🚀 Train a model in Model Development first.")
-    else:
-        clf_pipeline = st.session_state.trained_clf
-        le_target = st.session_state.trained_le_target
-        class_names = st.session_state.trained_class_names
-        test_results = st.session_state.test_results
-        X_test_df = st.session_state.trained_X_test.copy()
-        y_test_arr = st.session_state.trained_y_test
-
-        # Summary metrics
-        st.subheader("📊 Quick Summary")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.metric("Accuracy", f"{test_results['accuracy']:.3f}")
-        with c2:
-            st.metric("Test samples", len(y_test_arr))
-        with c3:
-            st.metric("Features", len(st.session_state.trained_feature_cols))
-
-        # Classification report table
-        st.subheader("📋 Classification Report (numbers)")
-        try:
-            report = classification_report(y_test_arr, test_results["y_pred"], output_dict=True, target_names=class_names)
-            report_df = pd.DataFrame(report).transpose().round(3)
-            st.dataframe(report_df, use_container_width=True)
-        except Exception:
-            try:
-                report = classification_report(y_test_arr, test_results["y_pred"], output_dict=True)
-                report_df = pd.DataFrame(report).transpose().round(3)
-                st.dataframe(report_df, use_container_width=True)
-            except Exception:
-                st.info("Classification report not available.")
-
-        st.markdown("---")
-
-        # Confusion matrix with explanation
-        st.subheader("🔁 Confusion Matrix — what it means")
-        try:
-            cm = confusion_matrix(y_test_arr, test_results["y_pred"])
-            cm_norm = cm.astype(float)
-            # normalize rows to show proportions
-            with np.errstate(all="ignore"):
-                row_sums = cm_norm.sum(axis=1, keepdims=True)
-                cm_prop = np.divide(cm_norm, row_sums, where=row_sums != 0)
-            # Plot heatmap (compact)
-            fig_cm, ax_cm = plt.subplots(figsize=(5, 4))
-            im = ax_cm.imshow(cm_prop, interpolation="nearest", aspect="auto")
-            ax_cm.set_title("Confusion matrix (proportions)")
-            ticks = np.arange(len(cm))
-            ax_cm.set_xticks(ticks)
-            ax_cm.set_yticks(ticks)
-            # labels if available
-            try:
-                xticklabels = [str(c) for c in class_names]
-                yticklabels = [str(c) for c in class_names]
-            except Exception:
-                xticklabels = [str(i) for i in ticks]
-                yticklabels = [str(i) for i in ticks]
-            ax_cm.set_xticklabels(xticklabels, rotation=45, ha="right")
-            ax_cm.set_yticklabels(yticklabels)
-            # annotate values
-            for i in range(cm.shape[0]):
-                for j in range(cm.shape[1]):
-                    val = cm_prop[i, j] if not np.isnan(cm_prop[i, j]) else 0.0
-                    ax_cm.text(j, i, f"{val:.2f}\n({int(cm[i,j])})", ha="center", va="center", fontsize=8, color="black")
-            plt.tight_layout()
-
-            col1, col2 = st.columns([1, 1.2])
-            with col1:
-                st.pyplot(fig_cm)
-            with col2:
-                # Plain-language explanation
-                st.markdown("**What does this mean?**")
-                st.write("Each row here is the actual class, and each column is the model's guess. Values show two things:")
-                st.write("- Top: proportion of the actual class that the model predicted as that column (decimal).")
-                st.write("- Bottom: raw count of samples.")
-                st.write("If most of the shading is on the diagonal (top-left to bottom-right), the model is doing well.")
-                st.write("Off-diagonal cells show where the model gets confused. For example, if many actual A → predicted B, that indicates those two look similar to the model.")
-        except Exception:
-            st.info("Confusion matrix not available.")
-            st.text(traceback.format_exc())
-
-        st.markdown("---")
-
-        # ROC and Precision-Recall
-        st.subheader("📈 ROC & Precision–Recall (how confident the model is)")
-        try:
-            clf = clf_pipeline.named_steps.get("classifier", clf_pipeline)
-            proba = None
-            if hasattr(clf_pipeline, "predict_proba"):
-                proba = clf_pipeline.predict_proba(X_test_df)
-            elif hasattr(clf, "decision_function"):
-                try:
-                    decision = clf.decision_function(X_test_df)
-                    # attempt to scale to [0,1]
-                    from sklearn.preprocessing import MinMaxScaler
-                    scaler = MinMaxScaler()
-                    proba = scaler.fit_transform(np.atleast_2d(decision).T)
-                except Exception:
-                    proba = None
-
-            if proba is not None and proba.ndim == 2 and proba.shape[1] == 2:
-                # binary case
-                y_score = proba[:, 1]
-                fpr, tpr, _ = roc_curve(y_test_arr, y_score)
-                roc_auc = auc(fpr, tpr)
-                fig_roc, ax_roc = plt.subplots(figsize=(5, 3))
-                ax_roc.plot(fpr, tpr, linewidth=1.8)
-                ax_roc.plot([0, 1], [0, 1], "--", linewidth=0.9)
-                ax_roc.set_xlabel("False Positive Rate")
-                ax_roc.set_ylabel("True Positive Rate")
-                ax_roc.set_title(f"ROC curve (AUC = {roc_auc:.3f})")
-                plt.tight_layout()
-
-                precision, recall, _ = precision_recall_curve(y_test_arr, y_score)
-                fig_pr, ax_pr = plt.subplots(figsize=(5, 3))
-                ax_pr.plot(recall, precision, linewidth=1.6)
-                ax_pr.set_xlabel("Recall")
-                ax_pr.set_ylabel("Precision")
-                ax_pr.set_title("Precision–Recall curve")
-                plt.tight_layout()
-
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.pyplot(fig_roc)
-                with col2:
-                    st.pyplot(fig_pr)
-
-                # plain language
-                st.markdown("**What does this mean?**")
-                st.write("- ROC AUC near 1.0 is great; 0.5 means guessing.")
-                st.write("- Precision–Recall shows how precise positive predictions are across recall levels. Use it when classes are imbalanced.")
-            elif proba is not None and proba.ndim == 2 and proba.shape[1] > 2:
-                # multiclass: show per-class ROC micro-average if possible (one-vs-rest)
-                n_classes = proba.shape[1]
-                fig_mc, ax_mc = plt.subplots(figsize=(6, 3.5))
-                has_any = False
-                for i in range(n_classes):
-                    try:
-                        fpr, tpr, _ = roc_curve((y_test_arr == i).astype(int), proba[:, i])
-                        roc_auc = auc(fpr, tpr)
-                        ax_mc.plot(fpr, tpr, linewidth=1.2, label=f"{class_names[i]} (AUC={roc_auc:.2f})")
-                        has_any = True
-                    except Exception:
-                        pass
-                if has_any:
-                    ax_mc.plot([0, 1], [0, 1], "--", linewidth=0.8)
-                    ax_mc.set_xlabel("False Positive Rate")
-                    ax_mc.set_ylabel("True Positive Rate")
-                    ax_mc.set_title("Per-class ROC (one-vs-rest)")
-                    ax_mc.legend(fontsize=8, loc="lower right")
-                    plt.tight_layout()
-                    st.pyplot(fig_mc)
-                    st.markdown("**What does this mean?** Each line shows how well the model separates one class from the rest. Higher is better.")
-                else:
-                    st.info("ROC per-class not available for this model/data.")
-            else:
-                st.info("Probability or score not available for ROC/PR plots.")
-        except Exception:
-            st.info("ROC/PR generation failed.")
-            st.text(traceback.format_exc())
-
-        st.markdown("---")
-
-        # Feature importances
-        st.subheader("⭐ Feature importance (what the model thinks matters)")
-        try:
-            clf = clf_pipeline.named_steps.get("classifier", clf_pipeline)
-            feat_names = None
-            try:
-                pre = clf_pipeline.named_steps.get("preprocessor", None)
-                if pre is not None and hasattr(pre, "get_feature_names_out"):
-                    feat_names = pre.get_feature_names_out()
-                else:
-                    feat_names = X_test_df.columns.tolist()
-            except Exception:
-                feat_names = X_test_df.columns.tolist()
-
-            imp_vals = None
-            if hasattr(clf, "feature_importances_"):
-                imp_vals = np.array(clf.feature_importances_)
-            elif hasattr(clf, "coef_"):
-                coef = np.array(clf.coef_)
-                # for multiclass, take mean absolute coefficient across classes
-                if coef.ndim == 2:
-                    imp_vals = np.mean(np.abs(coef), axis=0)
-                else:
-                    imp_vals = np.abs(coef)
-            if imp_vals is not None:
-                # build df and show top 12
-                imp_df = pd.DataFrame({"feature": feat_names, "importance": imp_vals})
-                imp_df = imp_df.sort_values("importance", ascending=False).head(12)
-                fig_fi, ax_fi = plt.subplots(figsize=(6, 3))
-                ax_fi.barh(imp_df["feature"][::-1], imp_df["importance"][::-1])
-                ax_fi.set_title("Top features by importance")
-                plt.tight_layout()
-                col1, col2 = st.columns([1, 0.7])
-                with col1:
-                    st.pyplot(fig_fi)
-                with col2:
-                    st.markdown("**What does this mean?**")
-                    st.write("Features at the top influence the model the most. Higher bars mean the model uses that column more when making decisions.")
-                    st.write("If a surprising feature is important, consider checking data leakage or correlations.")
-            else:
-                st.info("No feature importances or coefficients available for this model type.")
-        except Exception:
-            st.info("Feature importance generation failed.")
-            st.text(traceback.format_exc())
-
-        st.markdown("---")
-
-        # Partial Dependence Plot (compact)
-        st.subheader("🔎 Partial Dependence — how a feature affects predictions")
-        try:
-            numeric_cols = X_test_df.select_dtypes(include=np.number).columns.tolist()
-            if not numeric_cols:
-                st.info("No numeric features available for PDP.")
-            else:
-                pdp_feat = st.selectbox("Choose numeric feature for PDP", numeric_cols, index=0, key="pdp_feat")
-                base_row = X_test_df.iloc[[0]].copy().reset_index(drop=True)
-                grid = np.linspace(X_test_df[pdp_feat].min(), X_test_df[pdp_feat].max(), num=40)
-                pdp_preds = make_pdp_values(clf_pipeline, base_row, pdp_feat, grid)
-                fig_pdp, ax_pdp = plt.subplots(figsize=(6, 3))
-                ax_pdp.plot(grid, pdp_preds, linewidth=1.6, marker="o", markersize=3)
-                ax_pdp.set_xlabel(pdp_feat)
-                ax_pdp.set_ylabel("Predicted output / prob")
-                ax_pdp.set_title(f"Partial dependence (approx) for {pdp_feat}")
-                plt.tight_layout()
-                col1, col2 = st.columns([1, 0.9])
-                with col1:
-                    st.pyplot(fig_pdp)
-                with col2:
-                    st.markdown("**What does this mean?**")
-                    st.write("This plot shows how changing this feature (left to right) tends to change the model's predicted score/probability, holding other features near the selected sample.")
-                    st.write("A rising line means higher values increase model confidence; a flat line means that feature doesn't change predictions much.")
-        except Exception:
-            st.info("PDP generation failed.")
-            st.text(traceback.format_exc())
-
-# -------------------------
-# TAB 4: PREDICTIONS
-# -------------------------
-with tab4:
-    st.header("📈 Predictions")
-    st.markdown("Upload a file with the same features used in training and get predictions with a CSV download.")
-    if not st.session_state.data_uploaded:
-        st.info("👈 Upload data first.")
-    elif not st.session_state.model_trained:
-        st.info("🚀 Train a model first.")
-    else:
-        clf_pipeline = st.session_state.trained_clf
-        trained_feature_cols = st.session_state.trained_feature_cols
-        trained_le_target = st.session_state.trained_le_target
-
-        # NEW: Enhanced prediction file upload with Parquet support
-        st.subheader("📁 Upload Prediction Data")
-        pred_file = st.file_uploader("Upload CSV/XLSX with same features", type=["csv", "xlsx"], key="pred_file")
         
-        # NEW: Option to convert prediction CSV to Parquet too
-        pred_parquet_path = None
-        if pred_file and pred_file.name.lower().endswith('.csv'):
-            pred_file_size = get_file_size_mb(pred_file)
-            if pred_file_size > 5:  # Show option for prediction files larger than 5MB
-                st.info(f"Prediction file size: {pred_file_size:.1f} MB")
-                if PARQUET_AVAILABLE and st.button("⚡ Convert Prediction File to Parquet", key="pred_parquet"):
-                    pred_parquet_path, pred_conversion_info = convert_csv_to_parquet(pred_file, chunk_size=25000)
-                    if pred_parquet_path:
-                        st.success(f"✅ Prediction file converted to Parquet!")
-                        reduction = ((pred_conversion_info["original_size"] - pred_conversion_info["parquet_size"]) / pred_conversion_info["original_size"]) * 100
-                        st.metric("Size Reduction", f"{reduction:.1f}%")
+        st.markdown("---")
         
-        if pred_file or pred_parquet_path:
-            try:
-                # Load data (Parquet or regular)
-                if pred_parquet_path:
-                    new_df = load_parquet_file(pred_parquet_path)
-                    st.info("🏎️ Using Parquet format for faster processing")
-                else:
-                    name = pred_file.name.lower()
-                    if name.endswith(".csv"):
-                        new_df = pd.read_csv(pred_file)
-                    else:
-                        new_df = pd.read_excel(pred_file)
+        # SHAP Explanations
+        if SHAP_AVAILABLE:
+            st.markdown("### 🎯 SHAP Model Explanations")
+            
+            with st.spinner("Generating SHAP explanations..."):
+                shap_values, feature_names = generate_shap_values(
+                    model, X_test.head(100), model_name
+                )
                 
-                if new_df is not None:
-                    st.dataframe(new_df.head(), use_container_width=True)
-                    missing = [c for c in trained_feature_cols if c not in new_df.columns]
-                    extra = [c for c in new_df.columns if c not in trained_feature_cols]
+                if shap_values is not None:
+                    fig_summary, fig_waterfall = create_shap_plots(
+                        shap_values, feature_names, X_test.head(100)
+                    )
                     
-                    if missing:
-                        st.error(f"Missing columns: {missing}")
+                    shap_col1, shap_col2 = st.columns(2)
+                    
+                    with shap_col1:
+                        st.markdown("**Feature Importance Summary**")
+                        st.pyplot(fig_summary)
+                        
+                        st.markdown("""
+                        **How to read this plot:**
+                        - Each dot is a sample from your test data
+                        - X-axis shows impact on model prediction
+                        - Color shows feature value (red=high, blue=low)
+                        - Features ranked by importance (top to bottom)
+                        """)
+                    
+                    with shap_col2:
+                        st.markdown("**Individual Prediction Breakdown**")
+                        st.pyplot(fig_waterfall)
+                        
+                        st.markdown("""
+                        **How to read this plot:**
+                        - Shows how each feature contributes to first prediction
+                        - Positive values push prediction higher
+                        - Negative values push prediction lower
+                        - Helps understand individual decisions
+                        """)
+                else:
+                    st.warning("SHAP explanations not available for this model type")
+        else:
+            st.info("Install SHAP (`pip install shap`) for advanced model explanations")
+        
+        # Feature Importance (fallback)
+        st.markdown("### ⭐ Feature Importance Analysis")
+        
+        try:
+            classifier = model.named_steps.get('classifier', model)
+            
+            if hasattr(classifier, 'feature_importances_'):
+                # Tree-based models
+                importances = classifier.feature_importances_
+                feature_names = model.named_steps['preprocessor'].get_feature_names_out()
+                
+                importance_df = pd.DataFrame({
+                    'Feature': feature_names,
+                    'Importance': importances
+                }).sort_values('Importance', ascending=False).head(15)
+                
+                fig_imp, ax_imp = plt.subplots(figsize=(10, 6))
+                sns.barplot(data=importance_df, y='Feature', x='Importance', ax=ax_imp)
+                ax_imp.set_title('Top 15 Feature Importances')
+                plt.tight_layout()
+                st.pyplot(fig_imp)
+                
+            elif hasattr(classifier, 'coef_'):
+                # Linear models
+                coefficients = classifier.coef_
+                if coefficients.ndim > 1:
+                    coefficients = np.abs(coefficients).mean(axis=0)
+                
+                feature_names = model.named_steps['preprocessor'].get_feature_names_out()
+                
+                coef_df = pd.DataFrame({
+                    'Feature': feature_names,
+                    'Coefficient': np.abs(coefficients)
+                }).sort_values('Coefficient', ascending=False).head(15)
+                
+                fig_coef, ax_coef = plt.subplots(figsize=(10, 6))
+                sns.barplot(data=coef_df, y='Feature', x='Coefficient', ax=ax_coef)
+                ax_coef.set_title('Top 15 Feature Coefficients (Absolute)')
+                plt.tight_layout()
+                st.pyplot(fig_coef)
+            
+        except Exception as e:
+            st.warning(f"Feature importance not available: {e}")
+        
+        # Interactive What-If Analysis
+        st.markdown("### 🔧 What-If Analysis")
+        st.markdown("Modify feature values to see how predictions change")
+        
+        # Select a sample for what-if analysis
+        sample_idx = st.selectbox(
+            "Choose sample for analysis",
+            range(min(20, len(X_test))),
+            format_func=lambda x: f"Sample {x+1}"
+        )
+        
+        sample_data = X_test.iloc[sample_idx].copy()
+        
+        # Create form for feature modification
+        with st.form("whatif_analysis"):
+            st.markdown("**Modify feature values:**")
+            
+            whatif_cols = st.columns(3)
+            modified_data = sample_data.copy()
+            
+            # Show only top 10 most important features for UI simplicity
+            display_features = st.session_state.trained_feature_cols[:10]
+            
+            for i, feature in enumerate(display_features):
+                col_idx = i % 3
+                
+                with whatif_cols[col_idx]:
+                    if X_test[feature].dtype in ['int64', 'float64']:
+                        min_val = float(X_test[feature].min())
+                        max_val = float(X_test[feature].max())
+                        current_val = float(sample_data[feature])
+                        
+                        new_val = st.slider(
+                            f"{feature}",
+                            min_val, max_val, current_val,
+                            key=f"whatif_{feature}"
+                        )
+                        modified_data[feature] = new_val
                     else:
-                        features_df = new_df[trained_feature_cols]
-                        if extra:
-                            st.warning(f"Ignoring extra columns: {extra[:5]}{'...' if len(extra) > 5 else ''}")
+                        unique_vals = X_test[feature].unique()
+                        current_val = sample_data[feature]
                         
-                        # NEW: Enhanced prediction with batch processing for large files
-                        predict_button_text = "🔮 Generate Predictions"
-                        if len(new_df) > 50000:
-                            predict_button_text += f" (Batch processing {len(new_df):,} rows)"
+                        new_val = st.selectbox(
+                            f"{feature}",
+                            unique_vals,
+                            index=list(unique_vals).index(current_val) if current_val in unique_vals else 0,
+                            key=f"whatif_{feature}"
+                        )
+                        modified_data[feature] = new_val
+            
+            submitted = st.form_submit_button("🔍 Predict with modified values")
+            
+            if submitted:
+                try:
+                    # Make prediction with modified data
+                    modified_df = pd.DataFrame([modified_data])
+                    original_pred = model.predict(pd.DataFrame([sample_data]))[0]
+                    modified_pred = model.predict(modified_df)[0]
+                    
+                    # Show results
+                    result_col1, result_col2, result_col3 = st.columns(3)
+                    
+                    with result_col1:
+                        if st.session_state.trained_le_target:
+                            original_label = st.session_state.trained_le_target.inverse_transform([original_pred])[0]
+                            st.metric("Original Prediction", original_label)
+                        else:
+                            st.metric("Original Prediction", f"{original_pred:.3f}")
+                    
+                    with result_col2:
+                        if st.session_state.trained_le_target:
+                            modified_label = st.session_state.trained_le_target.inverse_transform([modified_pred])[0]
+                            st.metric("Modified Prediction", modified_label)
+                        else:
+                            st.metric("Modified Prediction", f"{modified_pred:.3f}")
+                    
+                    with result_col3:
+                        if problem_type == "classification":
+                            change = "Changed" if original_pred != modified_pred else "Same"
+                            st.metric("Result", change)
+                        else:
+                            change = modified_pred - original_pred
+                            st.metric("Change", f"{change:+.3f}")
+                    
+                    # Show probability changes for classification
+                    if problem_type == "classification" and hasattr(model, 'predict_proba'):
+                        original_proba = model.predict_proba(pd.DataFrame([sample_data]))[0]
+                        modified_proba = model.predict_proba(modified_df)[0]
                         
-                        if st.button(predict_button_text, use_container_width=True):
-                            with st.spinner("Predicting..."):
-                                try:
-                                    # NEW: Batch processing for large datasets
-                                    batch_size = 10000 if len(new_df) > 50000 else len(new_df)
-                                    all_preds = []
-                                    all_probs = []
-                                    
-                                    progress_bar = st.progress(0)
-                                    status_text = st.empty()
-                                    
-                                    for i in range(0, len(features_df), batch_size):
-                                        batch = features_df.iloc[i:i+batch_size]
-                                        
-                                        # Update progress
-                                        progress = min((i + len(batch)) / len(features_df), 1.0)
-                                        progress_bar.progress(progress)
-                                        status_text.text(f"Processing batch: {i+1:,} to {min(i+batch_size, len(features_df)):,} rows")
-                                        
-                                        # Predict batch
-                                        batch_preds = clf_pipeline.predict(batch)
-                                        all_preds.extend(batch_preds)
-                                        
-                                        # Try to get probabilities
-                                        try:
-                                            batch_probs = clf_pipeline.predict_proba(batch)
-                                            if all_probs == []:  # First batch
-                                                all_probs = batch_probs
-                                            else:
-                                                all_probs = np.vstack([all_probs, batch_probs])
-                                        except Exception:
-                                            all_probs = None
-                                    
-                                    progress_bar.progress(1.0)
-                                    status_text.text("✅ Prediction complete!")
-                                    
-                                    # Convert to arrays
-                                    preds = np.array(all_preds)
-                                    probs = all_probs
-                                    
-                                    # Build results dataframe
-                                    results = new_df.copy()
-                                    
-                                    if trained_le_target is not None:
-                                        try:
-                                            decoded = trained_le_target.inverse_transform(preds)
-                                            results["prediction"] = decoded
-                                            results["prediction_encoded"] = preds
-                                        except Exception:
-                                            results["prediction"] = preds
-                                    else:
-                                        results["prediction"] = preds
-                                    
-                                    if probs is not None:
-                                        if trained_le_target is not None and hasattr(trained_le_target, "classes_"):
-                                            prob_cols = [f"prob_{c}" for c in trained_le_target.classes_]
-                                        else:
-                                            prob_cols = [f"prob_{i}" for i in range(probs.shape[1])]
-                                        for i, col in enumerate(prob_cols):
-                                            results[col] = probs[:, i]
+                        if st.session_state.trained_class_names:
+                            proba_df = pd.DataFrame({
+                                'Class': st.session_state.trained_class_names,
+                                'Original': original_proba,
+                                'Modified': modified_proba,
+                                'Change': modified_proba - original_proba
+                            })
+                            st.dataframe(proba_df, use_container_width=True)
+                
+                except Exception as e:
+                    st.error(f"Prediction failed: {e}")
 
-                                    st.success(f"✅ Predicted {len(results):,} rows successfully!")
+# Tab 4: Predictions
+with tabs[3]:
+    st.markdown("## 📈 Make Predictions")
+    
+    if not st.session_state.data_uploaded:
+        st.info("Upload data and train a model first")
+    elif not st.session_state.model_trained:
+        st.info("Train a model in the Model Lab first")
+    else:
+        model = st.session_state.trained_model
+        feature_cols = st.session_state.trained_feature_cols
+        le_target = st.session_state.trained_le_target
+        
+        st.markdown("### 📁 Upload New Data for Predictions")
+        
+        pred_file = st.file_uploader(
+            "Upload data with same features as training",
+            type=["csv", "xlsx"],
+            key="prediction_file",
+            help="Make sure the file contains the same features used in training"
+        )
+        
+        if pred_file:
+            try:
+                # Load prediction data
+                if pred_file.name.lower().endswith('.csv'):
+                    new_data = pd.read_csv(pred_file)
+                else:
+                    new_data = pd.read_excel(pred_file)
+                
+                st.markdown("### 📊 Data Preview")
+                st.dataframe(new_data.head(), use_container_width=True)
+                
+                # Check for missing features
+                missing_features = set(feature_cols) - set(new_data.columns)
+                extra_features = set(new_data.columns) - set(feature_cols)
+                
+                status_col1, status_col2 = st.columns(2)
+                
+                with status_col1:
+                    if missing_features:
+                        st.error(f"Missing features: {list(missing_features)}")
+                    else:
+                        st.success("All required features present!")
+                
+                with status_col2:
+                    if extra_features:
+                        st.warning(f"Extra columns will be ignored: {len(extra_features)} columns")
+                    st.info(f"Ready to predict on {len(new_data):,} rows")
+                
+                if not missing_features:
+                    # Prediction options
+                    pred_options_col1, pred_options_col2 = st.columns(2)
+                    
+                    with pred_options_col1:
+                        include_probabilities = st.checkbox(
+                            "Include prediction probabilities",
+                            value=True,
+                            help="Include probability scores for each class (classification only)"
+                        )
+                    
+                    with pred_options_col2:
+                        batch_size = st.selectbox(
+                            "Batch size for large files",
+                            [1000, 5000, 10000, 50000],
+                            index=1,
+                            help="Process data in batches to manage memory"
+                        )
+                    
+                    # Make predictions
+                    if st.button("🔮 Generate Predictions", type="primary"):
+                        prediction_data = new_data[feature_cols]
+                        
+                        with st.spinner("Making predictions..."):
+                            try:
+                                # Batch processing for large datasets
+                                all_predictions = []
+                                all_probabilities = []
+                                
+                                progress_bar = st.progress(0)
+                                
+                                for i in range(0, len(prediction_data), batch_size):
+                                    batch = prediction_data.iloc[i:i+batch_size]
                                     
-                                    # Show sample results
-                                    st.subheader("📊 Prediction Results Sample")
-                                    st.dataframe(results.head(10), use_container_width=True)
+                                    # Update progress
+                                    progress = min((i + len(batch)) / len(prediction_data), 1.0)
+                                    progress_bar.progress(progress)
                                     
-                                    # NEW: Enhanced download options
-                                    st.subheader("📥 Download Options")
+                                    # Make predictions
+                                    batch_preds = model.predict(batch)
+                                    all_predictions.extend(batch_preds)
                                     
-                                    col1, col2 = st.columns(2)
+                                    # Get probabilities if requested
+                                    if include_probabilities and hasattr(model, 'predict_proba'):
+                                        batch_probs = model.predict_proba(batch)
+                                        all_probabilities.append(batch_probs)
+                                
+                                progress_bar.progress(1.0)
+                                
+                                # Combine results
+                                predictions = np.array(all_predictions)
+                                
+                                if all_probabilities:
+                                    probabilities = np.vstack(all_probabilities)
+                                else:
+                                    probabilities = None
+                                
+                                # Create results dataframe
+                                results_df = new_data.copy()
+                                
+                                # Add predictions
+                                if le_target:
+                                    results_df['prediction'] = le_target.inverse_transform(predictions)
+                                    results_df['prediction_encoded'] = predictions
+                                else:
+                                    results_df['prediction'] = predictions
+                                
+                                # Add probabilities
+                                if probabilities is not None:
+                                    if le_target:
+                                        class_names = le_target.classes_
+                                    else:
+                                        class_names = [f"class_{i}" for i in range(probabilities.shape[1])]
                                     
-                                    with col1:
-                                        # CSV Download
-                                        base = safe_filename_base(pred_file.name if pred_file else "predictions")
-                                        fname_csv = f"predictions_{base}.csv"
-                                        csv_buf = io.StringIO()
-                                        results.to_csv(csv_buf, index=False)
-                                        st.download_button("📄 Download as CSV", 
-                                                         data=csv_buf.getvalue(), 
-                                                         file_name=fname_csv,
-                                                         mime="text/csv")
+                                    for i, class_name in enumerate(class_names):
+                                        results_df[f'prob_{class_name}'] = probabilities[:, i]
+                                
+                                st.success(f"Predictions completed for {len(results_df):,} rows!")
+                                
+                                # Show results summary
+                                st.markdown("### 📊 Prediction Results")
+                                
+                                summary_col1, summary_col2, summary_col3 = st.columns(3)
+                                
+                                with summary_col1:
+                                    st.metric("Total Predictions", f"{len(results_df):,}")
+                                
+                                with summary_col2:
+                                    unique_preds = results_df['prediction'].nunique()
+                                    st.metric("Unique Predictions", unique_preds)
+                                
+                                with summary_col3:
+                                    most_common = results_df['prediction'].mode().iloc[0]
+                                    st.metric("Most Common", str(most_common))
+                                
+                                # Show sample results
+                                st.markdown("**Sample Results:**")
+                                st.dataframe(results_df.head(10), use_container_width=True)
+                                
+                                # Prediction distribution
+                                if results_df['prediction'].nunique() <= 20:
+                                    st.markdown("### 📈 Prediction Distribution")
+                                    pred_dist = results_df['prediction'].value_counts()
+                                    st.bar_chart(pred_dist)
+                                
+                                # Download options
+                                st.markdown("### 📥 Download Results")
+                                
+                                download_col1, download_col2 = st.columns(2)
+                                
+                                with download_col1:
+                                    # CSV download
+                                    csv_buffer = io.StringIO()
+                                    results_df.to_csv(csv_buffer, index=False)
                                     
-                                    with col2:
-                                        # NEW: Parquet Download option for large files
-                                        if PARQUET_AVAILABLE and len(results) > 10000:
-                                            fname_parquet = f"predictions_{base}.parquet"
-                                            parquet_buf = io.BytesIO()
-                                            results.to_parquet(parquet_buf, index=False)
-                                            st.download_button("📦 Download as Parquet (Faster)", 
-                                                             data=parquet_buf.getvalue(), 
-                                                             file_name=fname_parquet,
-                                                             mime="application/octet-stream")
+                                    st.download_button(
+                                        "📄 Download as CSV",
+                                        data=csv_buffer.getvalue(),
+                                        file_name=f"predictions_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                                        mime="text/csv"
+                                    )
+                                
+                                with download_col2:
+                                    # Excel download
+                                    excel_buffer = io.BytesIO()
+                                    with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                                        results_df.to_excel(writer, sheet_name='Predictions', index=False)
                                     
-                                    # NEW: Prediction summary statistics
-                                    if len(results) > 1000:
-                                        st.subheader("📈 Prediction Summary")
-                                        summary_cols = st.columns(3)
-                                        
-                                        with summary_cols[0]:
-                                            st.metric("Total Predictions", f"{len(results):,}")
-                                        
-                                        with summary_cols[1]:
-                                            if "prediction" in results.columns:
-                                                unique_preds = results["prediction"].nunique()
-                                                st.metric("Unique Predictions", unique_preds)
-                                        
-                                        with summary_cols[2]:
-                                            # Show most common prediction
-                                            if "prediction" in results.columns:
-                                                most_common = results["prediction"].mode().iloc[0] if len(results["prediction"].mode()) > 0 else "N/A"
-                                                st.metric("Most Common", str(most_common))
-                                        
-                                        # Show prediction distribution
-                                        if "prediction" in results.columns and results["prediction"].nunique() < 20:
-                                            pred_dist = results["prediction"].value_counts().head(10)
-                                            st.bar_chart(pred_dist)
-                                    
-                                except Exception as e:
-                                    st.error(f"Prediction failed: {e}")
-                                    st.text(traceback.format_exc())
+                                    st.download_button(
+                                        "📊 Download as Excel",
+                                        data=excel_buffer.getvalue(),
+                                        file_name=f"predictions_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                                    )
+                                
+                            except Exception as e:
+                                st.error(f"Prediction failed: {e}")
+                                st.text(traceback.format_exc())
+            
             except Exception as e:
                 st.error(f"Failed to load prediction file: {e}")
-                st.text(traceback.format_exc())
 
 # Footer
 st.markdown("---")
-st.markdown("Built with ❤️ using Streamlit | CE Innovation Labs © 2025")
+footer_col1, footer_col2, footer_col3 = st.columns(3)
 
-# NEW: Add installation instructions in sidebar
+with footer_col1:
+    st.markdown("**AutoML Platform v2.0**")
+    st.caption("Built with Streamlit")
+
+with footer_col2:
+    if st.session_state.model_trained:
+        st.markdown("**Current Model:**")
+        st.caption(f"{st.session_state.model_name}")
+
+with footer_col3:
+    st.markdown("**Available Libraries:**")
+    libs = []
+    if SHAP_AVAILABLE: libs.append("SHAP")
+    if OPTUNA_AVAILABLE: libs.append("Optuna") 
+    if MLFLOW_AVAILABLE: libs.append("MLflow")
+    st.caption(" • ".join(libs) if libs else "Standard ML only")
+
+# Installation helper in sidebar
 with st.sidebar:
-    st.markdown("---")
-    st.subheader("📦 Optional Dependencies")
-    
-    if not PARQUET_AVAILABLE:
-        st.warning("⚡ **For faster processing of large files:**")
-        st.code("pip install pyarrow", language="bash")
-    
-    if not IMB_AVAILABLE:
-        st.warning("⚖️ **For class balancing:**")
-        st.code("pip install imbalanced-learn", language="bash")
-    
-    if ProfileReport is None:
-        st.warning("📊 **For data profiling:**")
-        st.code("pip install ydata-profiling", language="bash")
-
-# ====== OPTIMIZED HELPERS ADDED ======
-
-import psutil  # NEW: system resource check
-
-def get_system_memory_mb():
-    try:
-        return psutil.virtual_memory().available / (1024 * 1024)
-    except Exception:
-        return None
-
-def get_file_size_mb(file_obj):
-    try:
-        current_pos = file_obj.tell()
-        file_obj.seek(0, 2)
-        size = file_obj.tell()
-        file_obj.seek(current_pos)
-        return size / (1024 * 1024)
-    except:
-        return 0
-
-# -------------------------
-# Optimized CSV → Parquet
-# -------------------------
-def convert_csv_to_parquet(uploaded_file, chunk_size=50000):
-    if not PARQUET_AVAILABLE:
-        st.error("PyArrow is required for Parquet conversion. Please install: pip install pyarrow")
-        return None, None
-    try:
-        original_size = get_file_size_mb(uploaded_file)
-        temp_dir = tempfile.mkdtemp()
-        parquet_path = os.path.join(temp_dir, f"{safe_filename_base(uploaded_file.name)}.parquet")
-
-        uploaded_file.seek(0)
-        total_rows = 0
-        uploaded_file.seek(0)
-        total_lines = sum(1 for _ in uploaded_file) - 1
-        uploaded_file.seek(0)
-
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        writer = None
-
-        with st.spinner("Converting CSV to Parquet format..."):
-            chunk_count = 0
-            for chunk_df in pd.read_csv(uploaded_file, chunksize=chunk_size):
-                chunk_count += 1
-                total_rows += len(chunk_df)
-                table = pa.Table.from_pandas(chunk_df, preserve_index=False)
-                if writer is None:
-                    writer = pq.ParquetWriter(parquet_path, table.schema)
-                writer.write_table(table)
-                progress = min(total_rows / total_lines, 1.0) if total_lines > 0 else 1.0
-                progress_bar.progress(progress)
-                status_text.text(f"Processing chunk {chunk_count}: {total_rows:,} rows")
-            if writer is not None:
-                writer.close()
-
-        progress_bar.progress(1.0)
-        status_text.text(f"✅ Conversion complete! Processed {total_rows:,} rows")
-        parquet_size = os.path.getsize(parquet_path) / (1024 * 1024)
-        return parquet_path, {"original_size": original_size, "parquet_size": parquet_size, "rows": total_rows}
-    except Exception as e:
-        st.error(f"Failed to convert CSV to Parquet: {e}")
-        return None, None
-
-# -------------------------
-# Optimized profiling
-# -------------------------
-def generate_profile_html_file(df: pd.DataFrame, tmp_dir: Optional[str] = None) -> str:
-    if ProfileReport is None:
-        out_html = "<h3>Profiling library not installed</h3>"
-        fd = tempfile.NamedTemporaryFile(delete=False, suffix=".html", dir=tmp_dir)
-        fd.write(out_html.encode("utf-8"))
-        fd.close()
-        return fd.name
-    use_light = df.shape[0] > 50000 or df.shape[1] > 50
-    profile = ProfileReport(
-        df,
-        title="Dataset Profiling Report",
-        explorative=True,
-        minimal=use_light,
-        correlations={"pearson": {"calculate": not use_light}},
-    )
-    fd = tempfile.NamedTemporaryFile(delete=False, suffix=".html", dir=tmp_dir)
-    fd_path = fd.name
-    fd.close()
-    try:
-        profile.to_file(fd_path)
-        return fd_path
-    except Exception:
-        html_str = profile.to_html()
-        with open(fd_path, "w", encoding="utf-8") as fh:
-            fh.write(html_str)
-        return fd_path
-
-# -------------------------
-# Optimized prediction batching
-# -------------------------
-def predict_in_batches(clf_pipeline, features_df, batch_size=10000):
-    preds = []
-    prob_list = []
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    for i in range(0, len(features_df), batch_size):
-        batch = features_df.iloc[i:i+batch_size]
-        progress = min((i + len(batch)) / len(features_df), 1.0)
-        progress_bar.progress(progress)
-        status_text.text(f"Processing batch: {i+1:,} → {min(i+batch_size, len(features_df)):,}")
-        batch_preds = clf_pipeline.predict(batch)
-        preds.extend(batch_preds)
-        try:
-            batch_probs = clf_pipeline.predict_proba(batch)
-            prob_list.append(batch_probs)
-        except Exception:
-            pass
-    progress_bar.progress(1.0)
-    status_text.text("✅ Prediction complete!")
-    probs = np.concatenate(prob_list, axis=0) if prob_list else None
-    return np.array(preds), probs
+    if not all([SHAP_AVAILABLE, OPTUNA_AVAILABLE, MLFLOW_AVAILABLE]):
+        st.markdown("---")
+        st.markdown("### 🚀 Enhance Your Experience")
+        
+        if not SHAP_AVAILABLE:
+            st.code("pip install shap", language="bash")
+            st.caption("For advanced model explanations")
+        
+        if not OPTUNA_AVAILABLE:
+            st.code("pip install optuna", language="bash")
+            st.caption("For hyperparameter optimization")
+        
+        if not MLFLOW_AVAILABLE:
+            st.code("pip install mlflow", language="bash")
+            st.caption("For experiment tracking")
