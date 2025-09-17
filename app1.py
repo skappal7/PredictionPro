@@ -783,8 +783,8 @@ with tab4:
             with st.expander("Required Features", expanded=True):
                 feature_df = pd.DataFrame({
                     'Feature': feature_cols,
-                    'Type': [str(training_data[col].dtype) for col in feature_cols],
-                    'Sample': [str(training_data[col].iloc[0]) for col in feature_cols]
+                    'Type': [str(training_data[col].dtype) if col in training_data.columns else 'Missing' for col in feature_cols],
+                    'Sample': [str(training_data[col].iloc[0]) if col in training_data.columns else 'N/A' for col in feature_cols]
                 })
                 st.dataframe(feature_df, use_container_width=True)
             
