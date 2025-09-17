@@ -606,7 +606,7 @@ with tab3:
         problem_type = get_session_value('trained_problem_type')
         class_names = get_session_value('trained_class_names')
         
-        if not all([model, X_test, y_test is not None, y_pred is not None]):
+        if model is None or X_test is None or y_test is None or y_pred is None:
             st.error("Missing training results. Please retrain the model.")
         
         # Performance Overview
