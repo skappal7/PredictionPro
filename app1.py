@@ -608,7 +608,6 @@ with tab3:
         
         if not all([model, X_test, y_test is not None, y_pred is not None]):
             st.error("Missing training results. Please retrain the model.")
-            return
         
         # Performance Overview
         st.markdown("### Performance Overview")
