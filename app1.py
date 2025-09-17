@@ -1889,11 +1889,11 @@ with tab4:
         </div>
         """, unsafe_allow_html=True)
     else:
-        model = st.session_state.trained_model
-        feature_cols = st.session_state.trained_feature_columns
-        le_target = st.session_state.trained_le_target
-        problem_type = st.session_state.trained_problem_type
-        training_data = st.session_state.training_data
+        model = st.session_state.get('trained_model')
+        feature_cols = st.session_state.get('trained_feature_columns')
+        le_target = st.session_state.get('trained_le_target'
+        problem_type = st.session_state.get('trained_problem_type')
+        training_data = st.session_state.get('training_data')
         
         st.markdown("### 📁 Upload Data for Predictions")
         
@@ -2397,7 +2397,7 @@ with tab5:
             st.markdown("Compare multiple models on the same dataset to find the best performer.")
             
             # Model selection for comparison
-            if st.session_state.trained_problem_type == "classification":
+            if st.session_state.get('trained_problem_type') == "classification":
                 available_models = {
                     "Random Forest": RandomForestClassifier(random_state=42),
                     "Gradient Boosting": GradientBoostingClassifier(random_state=42),
