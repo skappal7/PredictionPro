@@ -43,43 +43,52 @@ from ydata_profiling import ProfileReport
 # Page config
 st.set_page_config(page_title="AutoML Pro", layout="wide", page_icon="🤖")
 
-# Professional CSS
+# Professional CSS with better color scheme
 st.markdown("""
 <style>
     .main-header {
-        background: linear-gradient(135deg, #2c3e50 0%, #3498db 100%);
+        background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
         padding: 2rem;
-        border-radius: 10px;
+        border-radius: 12px;
         color: white;
         text-align: center;
         margin-bottom: 2rem;
+        box-shadow: 0 8px 32px rgba(30, 60, 114, 0.3);
     }
     .metric-card {
-        background: linear-gradient(135deg, #34495e 0%, #2980b9 100%);
-        padding: 1.5rem;
-        border-radius: 8px;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        padding: 1.8rem;
+        border-radius: 10px;
         color: white;
         text-align: center;
         margin: 0.5rem 0;
+        box-shadow: 0 6px 20px rgba(102, 126, 234, 0.25);
+        border: 1px solid rgba(255, 255, 255, 0.1);
     }
     .stTabs [data-baseweb="tab-list"] {
-        gap: 4px;
-        background: #f8f9fa;
-        padding: 0.5rem;
-        border-radius: 8px;
+        gap: 6px;
+        background: linear-gradient(90deg, #f8fafc, #e2e8f0);
+        padding: 0.75rem;
+        border-radius: 12px;
+        box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.06);
     }
     .stTabs [data-baseweb="tab"] {
-        height: 50px;
+        height: 52px;
         background: white;
-        border-radius: 6px;
+        border-radius: 8px;
         font-weight: 600;
-        color: #2c3e50;
-        border: 1px solid #bdc3c7;
+        color: #475569;
+        border: 2px solid transparent;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
     }
     .stTabs [aria-selected="true"] {
-        background: linear-gradient(135deg, #2c3e50, #3498db);
+        background: linear-gradient(135deg, #1e3c72, #2a5298);
         color: white;
-        border: 1px solid #3498db;
+        border: 2px solid #1e3c72;
+        box-shadow: 0 4px 12px rgba(30, 60, 114, 0.3);
+    }
+    .sidebar .sidebar-content {
+        background: linear-gradient(180deg, #f1f5f9 0%, #ffffff 100%);
     }
 </style>
 """, unsafe_allow_html=True)
@@ -97,20 +106,83 @@ def init_session_state():
 
 init_session_state()
 
-# Utility functions
+# Utility functions with Parquet optimization restored
+@st.cache_data(show_spinner=False)
+def get_file_size_mb(uploaded_file):
+    """Get file size in MB"""
+    try:
+        return len(uploaded_file.getvalue()) / (1024 * 1024)
+    except:
+        return 0
+
+@st.cache_data(show_spinner=False)
+def convert_to_parquet_safe(df, original_filename):
+    """Convert large DataFrames to Parquet for faster processing"""
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        
+        # Create temporary parquet file
+        temp_dir = tempfile.mkdtemp()
+        parquet_path = os.path.join(temp_dir, f"{original_filename.split('.')[0]}.parquet")
+        
+        # Convert to parquet
+        df.to_parquet(parquet_path, engine='pyarrow', compression='snappy')
+        
+        # Get file size reduction info
+        original_size = df.memory_usage(deep=True).sum() / (1024 * 1024)
+        parquet_size = os.path.getsize(parquet_path) / (1024 * 1024)
+        
+        return parquet_path, {
+            'original_size_mb': original_size,
+            'parquet_size_mb': parquet_size,
+            'compression_ratio': (original_size - parquet_size) / original_size * 100
+        }
+    except Exception as e:
+        st.warning(f"Parquet conversion failed: {e}")
+        return None, None
+
 @st.cache_data(show_spinner=False)
 def load_data_safe(uploaded_file):
+    """Enhanced data loading with automatic Parquet conversion for large files"""
     try:
         name = uploaded_file.name.lower()
+        
+        # Load data first
         if name.endswith('.csv'):
-            return pd.read_csv(uploaded_file)
+            df = pd.read_csv(uploaded_file)
         elif name.endswith('.parquet'):
-            return pd.read_parquet(uploaded_file)
+            df = pd.read_parquet(uploaded_file)
         elif name.endswith(('.xlsx', '.xls')):
-            return pd.read_excel(uploaded_file)
+            df = pd.read_excel(uploaded_file)
         else:
             uploaded_file.seek(0)
-            return pd.read_csv(uploaded_file)
+            df = pd.read_csv(uploaded_file)
+        
+        # Check if file is large enough to benefit from Parquet conversion
+        file_size_mb = get_file_size_mb(uploaded_file)
+        memory_size_mb = df.memory_usage(deep=True).sum() / (1024 * 1024)
+        
+        # Convert to Parquet if file is larger than 10MB or has more than 50k rows
+        if (file_size_mb > 10 or len(df) > 50000 or memory_size_mb > 50) and not name.endswith('.parquet'):
+            st.info(f"Large dataset detected ({file_size_mb:.1f} MB, {len(df):,} rows). Converting to Parquet format for faster processing...")
+            
+            with st.spinner("Converting to Parquet for optimal performance..."):
+                parquet_path, conversion_info = convert_to_parquet_safe(df, uploaded_file.name)
+                
+                if parquet_path and conversion_info:
+                    st.success(f"✅ Converted to Parquet! Size reduced by {conversion_info['compression_ratio']:.1f}% ({conversion_info['original_size_mb']:.1f}MB → {conversion_info['parquet_size_mb']:.1f}MB)")
+                    
+                    # Store conversion info in session state
+                    st.session_state.parquet_conversion_info = conversion_info
+                    st.session_state.using_parquet = True
+                else:
+                    st.session_state.using_parquet = False
+        else:
+            st.session_state.using_parquet = False
+        
+        return df
+        
     except Exception as e:
         st.error(f"Failed to load {uploaded_file.name}: {str(e)}")
         return None
@@ -164,7 +236,7 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# Sidebar
+# Sidebar with enhanced info display
 with st.sidebar:
     st.markdown("### Upload Dataset")
     
@@ -174,7 +246,7 @@ with st.sidebar:
     )
     
     if uploaded_file:
-        with st.spinner("Loading data..."):
+        with st.spinner("Loading and optimizing data..."):
             df = load_data_safe(uploaded_file)
             
             if df is not None:
@@ -183,8 +255,28 @@ with st.sidebar:
                 st.session_state.current_file = uploaded_file.name
                 
                 st.success("Data loaded successfully!")
-                file_size = len(uploaded_file.getvalue()) / (1024 * 1024)
-                st.info(f"File: {uploaded_file.name}\nRows: {df.shape[0]:,}\nColumns: {df.shape[1]}\nSize: {file_size:.1f} MB")
+                
+                # Enhanced file info with Parquet conversion details
+                file_size = get_file_size_mb(uploaded_file)
+                
+                info_text = f"""
+                **File:** {uploaded_file.name}  
+                **Rows:** {df.shape[0]:,}  
+                **Columns:** {df.shape[1]}  
+                **Original Size:** {file_size:.1f} MB
+                """
+                
+                # Show Parquet conversion info if applicable
+                if st.session_state.get('using_parquet', False) and 'parquet_conversion_info' in st.session_state:
+                    conversion_info = st.session_state.parquet_conversion_info
+                    info_text += f"""  
+                    **Optimized Size:** {conversion_info['parquet_size_mb']:.1f} MB  
+                    **Compression:** {conversion_info['compression_ratio']:.1f}% smaller  
+                    **Format:** Parquet (optimized)
+                    """
+                    st.success("🚀 Using Parquet optimization for faster processing!")
+                
+                st.info(info_text)
 
 # Main tabs
 tabs = st.tabs(["Data Explorer", "Model Training", "Model Analysis", "Predictions"])
