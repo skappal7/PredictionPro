@@ -160,13 +160,13 @@ def clean_data_robust(df: pd.DataFrame) -> pd.DataFrame:
     except Exception:
         return df.iloc[:, :min(3, df.shape[1])].fillna('Error').astype(str)
 
-@st.cache_data(show_spinner=False)
-def create_profile_safe(_df: pd.DataFrame, minimal: bool = True) -> Optional[ProfileReport]:
+# Remove @st.cache_data decorator from profile function to fix pickle error
+def create_profile_safe(df: pd.DataFrame, minimal: bool = True) -> Optional[ProfileReport]:
     try:
-        if _df is None or _df.empty:
+        if df is None or df.empty:
             return None
             
-        df_clean = clean_data_robust(_df)
+        df_clean = clean_data_robust(df)
         if df_clean.empty:
             return None
         
