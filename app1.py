@@ -335,7 +335,11 @@ with tabs[0]:
         # Data types visualization
         st.markdown("### 📊 Data Types Distribution")
         dtype_counts = df.dtypes.value_counts()
-        fig_dtypes = px.pie(values=dtype_counts.values, names=dtype_counts.index, title="Data Types Distribution")
+        fig_dtypes = px.pie(
+            values=dtype_counts.values, 
+            names=[str(dtype) for dtype in dtype_counts.index],  # Convert dtype objects to strings
+            title="Data Types Distribution"
+        )
         st.plotly_chart(fig_dtypes, use_container_width=True)
         
         # Data preview
