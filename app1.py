@@ -1,11 +1,11 @@
 """
-Enhanced Predictive Analytics AutoML App
+Enhanced Predictive Analytics AutoML App - Streamlined Version
 - Professional UI/UX with production-grade features
 - Advanced model explainability with SHAP integration
 - Hyperparameter optimization with Optuna
 - Model downloading capabilities
-- MLflow experiment tracking
 - Optimized caching and performance
+- Python 3.11+ compatible
 """
 
 import io
@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
 import hashlib
 import uuid
+import warnings
+warnings.filterwarnings('ignore')
 
 import matplotlib
 matplotlib.use("Agg")
@@ -29,7 +31,7 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-# Enhanced dependencies
+# Enhanced dependencies - only essential ones
 try:
     import shap
     SHAP_AVAILABLE = True
@@ -44,26 +46,12 @@ except ImportError:
     OPTUNA_AVAILABLE = False
 
 try:
-    import mlflow
-    import mlflow.sklearn
-    MLFLOW_AVAILABLE = True
-except ImportError:
-    MLFLOW_AVAILABLE = False
-
-try:
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-    PARQUET_AVAILABLE = True
-except ImportError:
-    PARQUET_AVAILABLE = False
-
-try:
     import cloudpickle
     CLOUDPICKLE_AVAILABLE = True
 except ImportError:
     CLOUDPICKLE_AVAILABLE = False
 
-# Core ML libraries
+# Core ML libraries - these are essential
 from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.preprocessing import LabelEncoder, OneHotEncoder, StandardScaler
 from sklearn.compose import ColumnTransformer
@@ -75,6 +63,7 @@ from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.metrics import (accuracy_score, confusion_matrix, classification_report, 
                            roc_curve, auc, precision_recall_curve, f1_score)
 
+# Optional imbalanced-learn
 try:
     from imblearn.pipeline import Pipeline as ImbPipeline
     from imblearn.over_sampling import SMOTE, RandomOverSampler
@@ -85,6 +74,7 @@ except ImportError:
     SMOTE = RandomOverSampler = RandomUnderSampler = None
     IMB_AVAILABLE = False
 
+# Optional profiling
 try:
     from ydata_profiling import ProfileReport
     PROFILING_LIB = "ydata_profiling"
@@ -158,17 +148,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Initialize MLflow if available
-@st.cache_resource
-def init_mlflow():
-    if MLFLOW_AVAILABLE:
-        mlflow.set_tracking_uri("sqlite:///mlflow.db")
-        return mlflow
-    return None
-
-mlflow_client = init_mlflow()
-
-# Session state initialization
+# Initialize session state - removed MLflow
 def init_session_state():
     defaults = {
         "data_uploaded": False,
@@ -693,9 +673,9 @@ with st.sidebar:
     features_status = [
         ("SHAP Explanations", SHAP_AVAILABLE),
         ("Hyperopt (Optuna)", OPTUNA_AVAILABLE),
-        ("Experiment Tracking", MLFLOW_AVAILABLE),
         ("Data Profiling", ProfileReport is not None),
-        ("Class Balancing", IMB_AVAILABLE)
+        ("Class Balancing", IMB_AVAILABLE),
+        ("Enhanced Serialization", CLOUDPICKLE_AVAILABLE)
     ]
     
     for feature, available in features_status:
@@ -1035,25 +1015,29 @@ with tabs[1]:
                         st.session_state.model_name = model_choice
                         st.session_state.problem_type = problem_type
                         
-                        # MLflow logging
-                        if mlflow_client:
-                            with mlflow.start_run(run_name=f"{model_choice}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}"):
-                                mlflow.log_params({
-                                    'algorithm': model_choice,
-                                    'features': len(feature_cols),
-                                    'balance_method': balance_method,
-                                    'test_size': test_size
-                                })
-                                mlflow.log_metrics(metrics)
-                                if use_hyperopt and st.session_state.best_params:
-                                    mlflow.log_params(st.session_state.best_params)
-                                mlflow.sklearn.log_model(model_pipeline, "model")
+                        # Simple experiment logging (without MLflow)
+                        experiment_record = {
+                            'timestamp': pd.Timestamp.now().isoformat(),
+                            'algorithm': model_choice,
+                            'features': len(feature_cols),
+                            'balance_method': balance_method,
+                            'test_size': test_size,
+                            'metrics': metrics,
+                            'hyperopt_used': use_hyperopt and st.session_state.best_params
+                        }
                         
-                        st.success(f"Model trained successfully! {list(metrics.items())[0][0].title()}: {list(metrics.values())[0]:.3f}")
+                        if 'experiment_history' not in st.session_state:
+                            st.session_state.experiment_history = []
+                        st.session_state.experiment_history.append(experiment_record)
+                        
+                        # Display success message
+                        success_metric = list(metrics.items())[0]
+                        st.success(f"✅ Model trained successfully! {success_metric[0].replace('_', ' ').title()}: {success_metric[1]:.3f}")
                         
                     except Exception as e:
-                        st.error(f"Training failed: {str(e)}")
-                        st.text(traceback.format_exc())
+                        st.error(f"❌ Training failed: {str(e)}")
+                        with st.expander("Show error details"):
+                            st.text(traceback.format_exc())
         
         with train_col2:
             # Model download section
@@ -1566,7 +1550,7 @@ with footer_col3:
     libs = []
     if SHAP_AVAILABLE: libs.append("SHAP")
     if OPTUNA_AVAILABLE: libs.append("Optuna") 
-    if MLFLOW_AVAILABLE: libs.append("MLflow")
+    if CLOUDPICKLE_AVAILABLE: libs.append("CloudPickle")
     st.caption(" • ".join(libs) if libs else "Standard ML only")
 
 # Installation helper in sidebar
@@ -1574,26 +1558,30 @@ with st.sidebar:
     missing_libs = []
     if not SHAP_AVAILABLE: missing_libs.append("shap")
     if not OPTUNA_AVAILABLE: missing_libs.append("optuna") 
-    if not MLFLOW_AVAILABLE: missing_libs.append("mlflow")
     if not CLOUDPICKLE_AVAILABLE: missing_libs.append("cloudpickle")
     
     if missing_libs:
         st.markdown("---")
-        st.markdown("### 🚀 Enhance Your Experience")
-        st.markdown("Install additional libraries for full functionality:")
+        st.markdown("### 📦 Optional Libraries")
+        st.markdown("Install for enhanced functionality:")
         
         if not SHAP_AVAILABLE:
             st.code("pip install shap", language="bash")
-            st.caption("📊 Advanced model explanations")
+            st.caption("🎯 Advanced model explanations")
         
         if not OPTUNA_AVAILABLE:
             st.code("pip install optuna", language="bash") 
-            st.caption("🔍 Hyperparameter optimization")
-        
-        if not MLFLOW_AVAILABLE:
-            st.code("pip install mlflow", language="bash")
-            st.caption("📈 Experiment tracking")
+            st.caption("🔍 Automated hyperparameter tuning")
             
         if not CLOUDPICKLE_AVAILABLE:
             st.code("pip install cloudpickle", language="bash")
             st.caption("🔧 Better model serialization")
+        
+        st.markdown("**Core libraries (required):**")
+        st.code("pip install streamlit scikit-learn pandas numpy matplotlib seaborn", language="bash")
+        
+        st.markdown("**Optional for data balancing:**")
+        st.code("pip install imbalanced-learn", language="bash")
+        
+        st.markdown("**Optional for data profiling:**")
+        st.code("pip install ydata-profiling", language="bash")
