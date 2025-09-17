@@ -774,7 +774,11 @@ with tab4:
         problem_type = get_session_value('trained_problem_type')
         training_data = get_session_value('training_data')
         
-        if not all([model, feature_cols, training_data is not None]):
+        if model is None:
+            st.error("Model is missing. Please retrain.")
+        elif feature_cols is None:
+            st.error("Feature columns missing. Please retrain.") 
+        elif training_data is None:
             st.error("Missing model data. Please retrain the model.")
         else:
             st.markdown("### Upload Data for Predictions")
