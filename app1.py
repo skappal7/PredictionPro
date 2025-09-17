@@ -1357,7 +1357,7 @@ with tabs[3]:
         'metrics': metrics,
         'timestamp': pd.Timestamp.now().isoformat(),
         'version': '2.0_safe'
-    }
+  
     
     # Try to include model
     try:
